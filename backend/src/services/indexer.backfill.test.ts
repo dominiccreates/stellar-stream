@@ -380,6 +380,30 @@ describe("Indexer backfill: RPC truncating a page", () => {
 
     expect(readCursor()).toBe(160);
   });
+
+  it("keeps paginating when the RPC returns an empty page that still has a cursor", async () => {
+    const cid = nextContractId();
+    setupDb(100);
+
+    mockGetLatestLedger.mockResolvedValue({ sequence: 220 });
+
+    const event110 = makeStreamCreatedEvent("stream-truncated-1", 110);
+    const event150 = makeStreamClaimedEvent("stream-truncated-1", 75, 150);
+
+    mockGetEvents
+      .mockResolvedValueOnce({ events: [event110], cursor: "cursor-empty-page" })
+      .mockResolvedValueOnce({ events: [], cursor: "cursor-empty-page" })
+      .mockResolvedValueOnce({ events: [event150], cursor: undefined });
+
+    await runOnePoll(cid);
+
+    expect(mockGetEvents).toHaveBeenCalledTimes(3);
+    expect(readCursor()).toBe(220);
+
+    const stored = getStoredEvents();
+    expect(stored).toHaveLength(2);
+    expect(stored.map((event) => event.ledger_sequence)).toEqual([110, 150]);
+  });
 });
 
 // ═══════════════════════════════════════════════════════════════════════════════

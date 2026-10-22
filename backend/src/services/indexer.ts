@@ -514,9 +514,19 @@ async function indexEventsWithCursorPagination(db: any, currentLedger: number): 
     }
 
     const events = eventsResponse.events ?? [];
+    const nextCursor = eventsResponse.cursor;
 
     if (events.length === 0) {
-      break;
+      if (!nextCursor) {
+        break;
+      }
+
+      logger.warn(
+        { cursor, nextCursor },
+        "RPC returned an empty page while pagination was still active; retrying with the remaining cursor",
+      );
+      cursor = nextCursor;
+      continue;
     }
 
     db.transaction(() => {
@@ -530,7 +540,7 @@ async function indexEventsWithCursorPagination(db: any, currentLedger: number): 
       }
     })();
 
-    cursor = eventsResponse.cursor;
+    cursor = nextCursor;
 
     if (!cursor) {
       break;
