@@ -7884,6 +7884,8 @@ fn test_1138_transfer_failure_after_authorization_rolls_back() {
     // t=1_500: 499 is claimable and the recipient signs, but the transfer fails.
     f.set_time(1_500);
     assert_eq!(f.client.claimable(&f.stream_id, &1_500), 499);
+    let before = f.stream();
+    let events_before = f.contract_events();
     f.sign_claim(&f.recipient, 499);
     assert!(f
         .client
@@ -7892,6 +7894,10 @@ fn test_1138_transfer_failure_after_authorization_rolls_back() {
 
     // Rollback: stream state, balances and events are exactly as before.
     let stream = f.stream();
+    assert_eq!(stream, before);
+    assert_eq!(f.contract_events(), events_before);
+    assert_eq!(f.token.balance(&f.sender), 0);
+    assert_eq!(f.token.balance(&sink), 999);
     assert_eq!(stream.claimed_amount, 1);
     assert_eq!(stream.last_claim_time, 1_200);
     assert_eq!(f.token.balance(&f.recipient), 1);
@@ -8340,4 +8346,82 @@ fn test_create_split_stream_overflowing_allocation_sum_is_atomic() {
     assert_eq!(parent_id, 1);
     assert_eq!(client.get_split_children(&parent_id).len(), 2);
     assert_eq!(token_client.balance(&contract_id), i128::MAX);
+}
+
+// #1136: every partial payout needs the stored recipient's exact authorization.
+#[test]
+fn test_1136_partial_claim_authority_is_checked_again_for_remainder() {
+    let env = Env::default();
+    let f = reg_fixture(&env, 1_000, 1_000, 2_000);
+    f.set_time(1_500);
+    f.sign_claim(&f.recipient, 1);
+    assert_eq!(f.client.claim(&f.stream_id, &f.recipient, &1), 1);
+    let before = f.stream();
+    let events_before = f.contract_events();
+    let attacker = Address::generate(&env);
+
+    // Missing authorization, sender authorization, and a third party cannot
+    // spend the recipient's remaining vested balance.
+    for signer in [None, Some(&f.sender), Some(&attacker)] {
+        env.mock_auths(&[]);
+        if let Some(signer) = signer {
+            f.sign_claim(signer, 499);
+        }
+        assert!(f
+            .client
+            .try_claim(&f.stream_id, &f.recipient, &499)
+            .is_err());
+        assert_eq!(f.stream(), before);
+        assert_eq!(f.contract_events(), events_before);
+        assert_eq!(f.token.balance(&f.recipient), 1);
+        assert_eq!(f.token.balance(&f.contract_id), 999);
+        assert_eq!(f.token.balance(&f.sender), 0);
+        assert_eq!(f.token.balance(&attacker), 0);
+    }
+
+    // An authorization for one unit does not authorize a different amount.
+    f.sign_claim(&f.recipient, 1);
+    assert!(f
+        .client
+        .try_claim(&f.stream_id, &f.recipient, &499)
+        .is_err());
+    assert_eq!(f.stream(), before);
+    assert_eq!(f.contract_events(), events_before);
+    assert_eq!(f.token.balance(&f.recipient), 1);
+    assert_eq!(f.token.balance(&f.contract_id), 999);
+
+    // A signer cannot replace the recorded recipient with their own address.
+    env.mock_auths(&[soroban_sdk::testutils::MockAuth {
+        address: &attacker,
+        invoke: &soroban_sdk::testutils::MockAuthInvoke {
+            contract: &f.contract_id,
+            fn_name: "claim",
+            args: (f.stream_id, attacker.clone(), 499i128).into_val(&env),
+            sub_invokes: &[],
+        },
+    }]);
+    assert!(f.client.try_claim(&f.stream_id, &attacker, &499).is_err());
+    assert_eq!(f.stream(), before);
+    assert_eq!(f.contract_events(), events_before);
+    assert_eq!(f.token.balance(&attacker), 0);
+    assert_eq!(f.token.balance(&f.recipient), 1);
+    assert_eq!(f.token.balance(&f.contract_id), 999);
+
+    f.sign_claim(&f.recipient, 499);
+    assert_eq!(f.client.claim(&f.stream_id, &f.recipient, &499), 499);
+    let after = f.stream();
+    assert_eq!(after.sender, before.sender);
+    assert_eq!(after.recipient, before.recipient);
+    assert_eq!(after.token, before.token);
+    assert_eq!(after.claimed_amount, 500);
+    assert_eq!(after.last_claim_time, 1_500);
+    assert_eq!(f.token.balance(&f.recipient), 500);
+    assert_eq!(f.token.balance(&f.contract_id), 500);
+    assert_eq!(f.token.balance(&f.sender), 0);
+    assert_eq!(f.token.balance(&attacker), 0);
+    let event: StreamClaimed = f.last_event(symbol_short!("Claimed")).into_val(&env);
+    assert_eq!(event.actor, f.recipient);
+    assert_eq!(event.recipient, f.recipient);
+    assert_eq!(event.amount, 499);
+    assert_eq!(event.claimed_amount, 500);
 }

@@ -79,8 +79,10 @@ export function resetAssetAllowlistOutcome(): void {
  * surfacing structured outcome and latency signals.
  *
  * Boundary semantics (documented, deterministic):
- * - Asset codes are trimmed, uppercased (mixed-case normalized), and deduplicated in first-seen
- *   order. The resulting `validAssets` list is stable and never silently reordered.
+ * - Asset codes are trimmed, uppercased (mixed-case normalized), deduplicated, and sorted
+ *   lexicographically (`A–Z`, `0–9`) so that `validAssets` matches the canonical normalized
+ *   sorted asset list returned by `parseAllowedAssetsConfig()`, `getAllowedAssets()`, and the
+ *   `/api/assets` and `/api/admin/assets` endpoints.
  * - Duplicates (including mixed-case variants of the same code) are stripped and counted;
  *   this is a `success` outcome.
  * - Empty tokens and malformed codes are treated as invalid configuration (`blocked`).
@@ -98,7 +100,7 @@ export function evaluateAssetAllowlistConfig(
   validAssets: string[];
   signal: AssetAllowlistOutcomeSignal;
 } {
-  const start = context?.startPerf ?? date.now();
+  const start = context?.startPerf ?? Date.now();
   const rawString = typeof rawInput === "string" ? rawInput.trim() : "";
   const allowEmpty = context?.allowEmpty ?? false;
 
@@ -131,11 +133,13 @@ export function evaluateAssetAllowlistConfig(
     }
   }
 
+  validAssets.sort();
+
   const latencyMs = Math.max(0, Date.now() - start);
 
   let outcome: AssetAllowlistOutcome;
   let detail: string;
-  let isNormalEmpty = false;
+  let isNormalEmpty: boolean;
 
   if (rawString.length === 0) {
     if (allowEmpty) {

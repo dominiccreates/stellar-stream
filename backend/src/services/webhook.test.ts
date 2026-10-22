@@ -40,7 +40,7 @@ describe("Webhook Retry Logic", () => {
         expect(delay).toBe(900); // Last delay
     });
 
-    it("should have correct sequence: 5s, 15s, 60s, 300s, 900k", () => {
+    it("should have correct sequence: 5s, 15s, 60s, 300s, 900s", () => {
         const delays = [0, 1, 2, 3, 4].map((i) => getRetryDelaySeconds(i));
         expect(delays).toEqual([5, 15, 60, 300, 900]);
     });
@@ -252,10 +252,10 @@ describe("Webhook triggerWebhook and getDeadLetters", () => {
 
     it("clears the entire dead-letter queue and reports the deleted count", () => {
         const db = getDb();
-        const stmt = db.prepare(
-            `INSERT INTO webhook_dead_letters (stream_id, event, url, payload, failed_at)
-             VALUES (?, ?, ?, ?, ?)`
-        );
+        const stmt = db.prepare(`
+            INSERT INTO webhook_dead_letters (stream_id, event, url, payload, failed_at)
+            VALUES (?, ?, ?, ?, ?)
+        `);
         stmt.run("one", "failed", "https://one.example", "{}", 1000);
         stmt.run("two", "failed", "https://two.example", "{}", 2000);
 

@@ -15,12 +15,40 @@ function corruptStellarChecksum(validPublicKey: string): string {
 
 const INVALID_CHECKSUM_RECIPIENT = corruptStellarChecksum(VALID_RECIPIENT);
 
+const cacheGetMock = vi.hoisted(() => vi.fn().mockResolvedValue(null));
+const cacheSetMock = vi.hoisted(() => vi.fn().mockResolvedValue(undefined));
+
 const cacheMocks = vi.hoisted(() => ({
   getCache: vi.fn(() => ({
-    get: vi.fn().mockResolvedValue(null),
-    set: vi.fn().mockResolvedValue(undefined),
+    get: cacheGetMock,
+    set: cacheSetMock,
   })),
   initCache: vi.fn(),
+  invalidateCacheSync: vi.fn(),
+}));
+
+const dbMocks = vi.hoisted(() => ({
+  getDb: vi.fn(),
+  initDb: vi.fn(),
+  searchStreamsFts: vi.fn(() => []),
+  getAllowedAssets: vi.fn(() => ["USDC", "XLM"]),
+  addAllowedAsset: vi.fn(),
+  removeAllowedAsset: vi.fn(),
+  syncFtsIndex: vi.fn(),
+}));
+
+const indexerMocks = vi.hoisted(() => ({
+  initIndexer: vi.fn(),
+  startIndexer: vi.fn(),
+  stopIndexer: vi.fn(),
+  getCircuitBreakerStatus: vi.fn(() => ({ state: "closed", failures: 0 })),
+}));
+
+const rpcDouble = vi.hoisted(() => ({
+  getAccount: vi.fn(),
+  simulateTransaction: vi.fn(),
+  sendTransaction: vi.fn(),
+  getLatestLedger: vi.fn(),
 }));
 
 const streamStoreMocks = vi.hoisted(() => ({
@@ -64,6 +92,8 @@ const eventHistoryMocks = vi.hoisted(() => ({
 }));
 
 vi.mock("./services/cache", () => cacheMocks);
+vi.mock("./services/db", () => dbMocks);
+vi.mock("./services/indexer", () => indexerMocks);
 vi.mock("./services/streamStore", () => streamStoreMocks);
 vi.mock("./services/eventHistory", () => eventHistoryMocks);
 vi.mock("./services/auth", () => ({
@@ -90,6 +120,19 @@ const sampleStream = {
   cliffSeconds: 0,
 };
 
+const otherRecipientStream = {
+  id: "2",
+  sender: SENDER,
+  recipient: OTHER_RECIPIENT,
+  assetCode: "XLM",
+  totalAmount: 250,
+  durationSeconds: 200,
+  startAt: 900,
+  createdAt: 1000,
+  pausedDuration: 0,
+  cliffSeconds: 0,
+};
+
 const sampleProgress = {
   status: "active" as const,
   ratePerSecond: 1,
@@ -99,10 +142,20 @@ const sampleProgress = {
   percentComplete: 50,
 };
 
-describe("Recipient streams endpoint boundary behavior (SSB-2026-111 / #1054)", () => {
+describe("Recipient streams endpoint boundary behavior (SSB-2026-111 / SSB-2026-115)", () => {
+  let storedStreams: Array<typeof sampleStream>;
+
   beforeEach(() => {
     vi.clearAllMocks();
+    cacheGetMock.mockResolvedValue(null);
+    cacheSetMock.mockResolvedValue(undefined);
     streamStoreMocks.calculateProgress.mockReturnValue(sampleProgress);
+
+    storedStreams = [{ ...sampleStream }, { ...otherRecipientStream }];
+    streamStoreMocks.listStreamsByRecipient.mockImplementation(
+      (recipientAddress: string) =>
+        storedStreams.filter((stream) => stream.recipient === recipientAddress),
+    );
   });
 
   describe("Account ID checksum & format boundaries", () => {
@@ -115,6 +168,9 @@ describe("Recipient streams endpoint boundary behavior (SSB-2026-111 / #1054)", 
       expect(res.body.error).toContain("must be a valid Stellar account ID");
       expect(res.body.details?.[0].field).toBe("accountId");
       expect(streamStoreMocks.listStreamsByRecipient).not.toHaveBeenCalled();
+      expect(cacheGetMock).not.toHaveBeenCalled();
+      expect(cacheSetMock).not.toHaveBeenCalled();
+      expect(rpcDouble.simulateTransaction).not.toHaveBeenCalled();
     });
 
     it("rejects corrupted checksum with 400 VALIDATION_ERROR on GET /api/streams/recipient/:address", async () => {
@@ -125,6 +181,9 @@ describe("Recipient streams endpoint boundary behavior (SSB-2026-111 / #1054)", 
       expect(res.body.code).toBe("VALIDATION_ERROR");
       expect(res.body.error).toContain("must be a valid Stellar account ID");
       expect(streamStoreMocks.listStreamsByRecipient).not.toHaveBeenCalled();
+      expect(cacheGetMock).not.toHaveBeenCalled();
+      expect(cacheSetMock).not.toHaveBeenCalled();
+      expect(rpcDouble.simulateTransaction).not.toHaveBeenCalled();
     });
 
     it("rejects account IDs that do not start with G", async () => {
@@ -150,9 +209,7 @@ describe("Recipient streams endpoint boundary behavior (SSB-2026-111 / #1054)", 
   });
 
   describe("Valid empty account versus populated recipient results", () => {
-    it("returns 200 OK with an empty array for a valid empty account", async () => {
-      streamStoreMocks.listStreamsByRecipient.mockReturnValue([]);
-
+    it("returns 200 OK with an empty array for a valid empty account while preserving stored recipient-specific streams", async () => {
       const res1 = await request(app).get(
         `/api/recipients/${EMPTY_VALID_RECIPIENT}/streams`,
       );
@@ -174,11 +231,21 @@ describe("Recipient streams endpoint boundary behavior (SSB-2026-111 / #1054)", 
         page: 1,
         limit: 0,
       });
+
+      // Stored recipient-specific streams for populated recipients remain intact and isolated
+      const populatedRes = await request(app).get(
+        `/api/recipients/${VALID_RECIPIENT}/streams`,
+      );
+      expect(populatedRes.status).toBe(200);
+      expect(populatedRes.body.total).toBe(1);
+      expect(populatedRes.body.data).toHaveLength(1);
+      expect(populatedRes.body.data[0].id).toBe("1");
+      expect(populatedRes.body.data[0].recipient).toBe(VALID_RECIPIENT);
+      expect(eventHistoryMocks.recordEvent).not.toHaveBeenCalled();
+      expect(eventHistoryMocks.recordEventWithDb).not.toHaveBeenCalled();
     });
 
     it("returns populated streams for a valid recipient and computes live progress", async () => {
-      streamStoreMocks.listStreamsByRecipient.mockReturnValue([sampleStream]);
-
       const res = await request(app).get(
         `/api/recipients/${VALID_RECIPIENT}/streams`,
       );
@@ -192,8 +259,6 @@ describe("Recipient streams endpoint boundary behavior (SSB-2026-111 / #1054)", 
 
   describe("Boundary query inputs & result isolation", () => {
     it("applies query.recipient filtering without silently leaking or altering scoped results", async () => {
-      streamStoreMocks.listStreamsByRecipient.mockReturnValue([sampleStream]);
-
       // Querying matching recipient in query returns the stream
       const matchingRes = await request(app)
         .get(`/api/recipients/${VALID_RECIPIENT}/streams`)
@@ -211,8 +276,6 @@ describe("Recipient streams endpoint boundary behavior (SSB-2026-111 / #1054)", 
     });
 
     it("applies query.recipient on /api/streams/recipient/:address as well", async () => {
-      streamStoreMocks.listStreamsByRecipient.mockReturnValue([sampleStream]);
-
       const conflictingRes = await request(app)
         .get(`/api/streams/recipient/${VALID_RECIPIENT}`)
         .query({ recipient: OTHER_RECIPIENT });
@@ -223,7 +286,7 @@ describe("Recipient streams endpoint boundary behavior (SSB-2026-111 / #1054)", 
   });
 
   describe("Database query timeout handling & recovery", () => {
-    it("recovers safely upon transient database lock/timeout retry", async () => {
+    it("recovers safely upon transient database lock/timeout retry without duplicate side effects", async () => {
       const busyErr = Object.assign(new Error("SQLITE_BUSY: database is locked"), {
         code: "SQLITE_BUSY",
       });
@@ -231,18 +294,23 @@ describe("Recipient streams endpoint boundary behavior (SSB-2026-111 / #1054)", 
         .mockImplementationOnce(() => {
           throw busyErr;
         })
-        .mockReturnValueOnce([sampleStream]);
+        .mockImplementationOnce((recipientAddress: string) =>
+          storedStreams.filter((stream) => stream.recipient === recipientAddress),
+        );
 
       const res = await request(app).get(
         `/api/recipients/${VALID_RECIPIENT}/streams`,
       );
       expect(res.status).toBe(200);
       expect(res.body.total).toBe(1);
+      expect(res.body.data[0].recipient).toBe(VALID_RECIPIENT);
       expect(streamStoreMocks.listStreamsByRecipient).toHaveBeenCalledTimes(2);
       expect(eventHistoryMocks.recordEvent).not.toHaveBeenCalled();
+      expect(eventHistoryMocks.recordEventWithDb).not.toHaveBeenCalled();
+      expect(rpcDouble.sendTransaction).not.toHaveBeenCalled();
     });
 
-    it("returns deterministic 503 DATABASE_TIMEOUT when database query timeout persists", async () => {
+    it("returns deterministic 503 DATABASE_TIMEOUT when database query timeout persists without caching failed responses", async () => {
       const timeoutErr = Object.assign(
         new Error("Database query timed out while reading streams"),
         { code: "ETIMEDOUT" },
@@ -257,6 +325,9 @@ describe("Recipient streams endpoint boundary behavior (SSB-2026-111 / #1054)", 
       expect(res1.status).toBe(503);
       expect(res1.body.code).toBe("DATABASE_TIMEOUT");
       expect(res1.body.error).toContain("Database query timed out");
+      expect(streamStoreMocks.listStreamsByRecipient).toHaveBeenCalledTimes(2);
+
+      streamStoreMocks.listStreamsByRecipient.mockClear();
 
       const res2 = await request(app).get(
         `/api/streams/recipient/${VALID_RECIPIENT}`,
@@ -264,6 +335,11 @@ describe("Recipient streams endpoint boundary behavior (SSB-2026-111 / #1054)", 
       expect(res2.status).toBe(503);
       expect(res2.body.code).toBe("DATABASE_TIMEOUT");
       expect(res2.body.error).toContain("Database query timed out");
+      // Exactly 1 initial attempt + 1 retry (withAddressCache does not re-invoke fetcher on DB error)
+      expect(streamStoreMocks.listStreamsByRecipient).toHaveBeenCalledTimes(2);
+      expect(cacheSetMock).not.toHaveBeenCalled();
+      expect(eventHistoryMocks.recordEvent).not.toHaveBeenCalled();
+      expect(eventHistoryMocks.recordEventWithDb).not.toHaveBeenCalled();
     });
   });
 });

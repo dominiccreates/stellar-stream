@@ -28,7 +28,6 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import Database from "better-sqlite3";
 
-// ── Stub all Prometheus metrics ───────────────────────────────────────────────
 vi.mock("./metrics", () => ({
   eventsIndexedTotal: { inc: vi.fn() },
   ledgersScannedTotal: { inc: vi.fn() },
@@ -38,6 +37,8 @@ vi.mock("./metrics", () => ({
   indexerErrorsTotal: { inc: vi.fn() },
   indexerCircuitState: { set: vi.fn() },
   indexerOutcome: { set: vi.fn() },
+  indexerEventsDedupedTotal: { inc: vi.fn() },
+  indexerPollDurationMs: { set: vi.fn() },
 }));
 
 // ── In-memory SQLite DB (replaced per-test) ───────────────────────────────────

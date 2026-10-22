@@ -5,6 +5,7 @@ import { Keypair } from "@stellar/stellar-sdk";
 const SENDER = Keypair.random().publicKey();
 const VALID_RECIPIENT = Keypair.random().publicKey();
 const EMPTY_VALID_RECIPIENT = Keypair.random().publicKey();
+const OTHER_RECIPIENT = Keypair.random().publicKey();
 
 function corruptStellarChecksum(validPublicKey: string): string {
   const lastChar = validPublicKey[validPublicKey.length - 1];
@@ -14,12 +15,40 @@ function corruptStellarChecksum(validPublicKey: string): string {
 
 const INVALID_CHECKSUM_RECIPIENT = corruptStellarChecksum(VALID_RECIPIENT);
 
+const cacheGetMock = vi.hoisted(() => vi.fn().mockResolvedValue(null));
+const cacheSetMock = vi.hoisted(() => vi.fn().mockResolvedValue(undefined));
+
 const cacheMocks = vi.hoisted(() => ({
   getCache: vi.fn(() => ({
-    get: vi.fn().mockResolvedValue(null),
-    set: vi.fn().mockResolvedValue(undefined),
+    get: cacheGetMock,
+    set: cacheSetMock,
   })),
   initCache: vi.fn(),
+  invalidateCacheSync: vi.fn(),
+}));
+
+const dbMocks = vi.hoisted(() => ({
+  getDb: vi.fn(),
+  initDb: vi.fn(),
+  searchStreamsFts: vi.fn(() => []),
+  getAllowedAssets: vi.fn(() => ["USDC", "XLM"]),
+  addAllowedAsset: vi.fn(),
+  removeAllowedAsset: vi.fn(),
+  syncFtsIndex: vi.fn(),
+}));
+
+const indexerMocks = vi.hoisted(() => ({
+  initIndexer: vi.fn(),
+  startIndexer: vi.fn(),
+  stopIndexer: vi.fn(),
+  getCircuitBreakerStatus: vi.fn(() => ({ state: "closed", failures: 0 })),
+}));
+
+const rpcDouble = vi.hoisted(() => ({
+  getAccount: vi.fn(),
+  simulateTransaction: vi.fn(),
+  sendTransaction: vi.fn(),
+  getLatestLedger: vi.fn(),
 }));
 
 const streamStoreMocks = vi.hoisted(() => ({
@@ -63,6 +92,8 @@ const eventHistoryMocks = vi.hoisted(() => ({
 }));
 
 vi.mock("./services/cache", () => cacheMocks);
+vi.mock("./services/db", () => dbMocks);
+vi.mock("./services/indexer", () => indexerMocks);
 vi.mock("./services/streamStore", () => streamStoreMocks);
 vi.mock("./services/eventHistory", () => eventHistoryMocks);
 vi.mock("./services/auth", () => ({
@@ -89,6 +120,19 @@ const sampleStream = {
   cliffSeconds: 0,
 };
 
+const otherRecipientStream = {
+  id: "2",
+  sender: SENDER,
+  recipient: OTHER_RECIPIENT,
+  assetCode: "XLM",
+  totalAmount: 300,
+  durationSeconds: 300,
+  startAt: 900,
+  createdAt: 1000,
+  pausedDuration: 0,
+  cliffSeconds: 0,
+};
+
 const sampleProgress = {
   status: "active" as const,
   ratePerSecond: 1,
@@ -98,13 +142,23 @@ const sampleProgress = {
   percentComplete: 50,
 };
 
-describe("Recipient streams endpoint recovery & account validation (#1055)", () => {
+describe("Recipient streams endpoint recovery & account validation (#1055 / SSB-2026-115)", () => {
+  let dbTableDouble: Array<typeof sampleStream>;
+
   beforeEach(() => {
     vi.clearAllMocks();
+    cacheGetMock.mockResolvedValue(null);
+    cacheSetMock.mockResolvedValue(undefined);
     streamStoreMocks.calculateProgress.mockReturnValue(sampleProgress);
+
+    dbTableDouble = [{ ...sampleStream }, { ...otherRecipientStream }];
+    streamStoreMocks.listStreamsByRecipient.mockImplementation(
+      (recipientAddress: string) =>
+        dbTableDouble.filter((row) => row.recipient === recipientAddress),
+    );
   });
 
-  it("distinguishes invalid account checksum (400 VALIDATION_ERROR) from valid empty account (200 empty list)", async () => {
+  it("distinguishes invalid account checksum (400 VALIDATION_ERROR) from valid empty account (200 empty list) while keeping stored recipient streams intact", async () => {
     const invalidRes1 = await request(app).get(
       `/api/recipients/${INVALID_CHECKSUM_RECIPIENT}/streams`,
     );
@@ -119,8 +173,7 @@ describe("Recipient streams endpoint recovery & account validation (#1055)", () 
     expect(invalidRes2.status).toBe(400);
     expect(invalidRes2.body.code).toBe("VALIDATION_ERROR");
     expect(streamStoreMocks.listStreamsByRecipient).not.toHaveBeenCalled();
-
-    streamStoreMocks.listStreamsByRecipient.mockReturnValue([]);
+    expect(cacheGetMock).not.toHaveBeenCalled();
 
     const emptyRes1 = await request(app).get(
       `/api/recipients/${EMPTY_VALID_RECIPIENT}/streams`,
@@ -143,9 +196,19 @@ describe("Recipient streams endpoint recovery & account validation (#1055)", () 
       page: 1,
       limit: 0,
     });
+
+    // Verify stored recipient-specific results are untouched and properly scoped
+    expect(dbTableDouble).toHaveLength(2);
+    const validRes = await request(app).get(
+      `/api/recipients/${VALID_RECIPIENT}/streams`,
+    );
+    expect(validRes.status).toBe(200);
+    expect(validRes.body.total).toBe(1);
+    expect(validRes.body.data[0].id).toBe("1");
+    expect(validRes.body.data[0].recipient).toBe(VALID_RECIPIENT);
   });
 
-  it("retries once and recovers safely when database query timeout is transient", async () => {
+  it("retries once and recovers safely when database query timeout is transient on both recipient endpoints", async () => {
     const timeoutErr = Object.assign(new Error("SQLITE_BUSY: database query timeout"), {
       code: "SQLITE_BUSY",
     });
@@ -154,21 +217,53 @@ describe("Recipient streams endpoint recovery & account validation (#1055)", () 
       .mockImplementationOnce(() => {
         throw timeoutErr;
       })
-      .mockReturnValueOnce([sampleStream]);
+      .mockImplementationOnce((recipientAddress: string) =>
+        dbTableDouble.filter((row) => row.recipient === recipientAddress),
+      );
 
-    const res = await request(app).get(
+    const res1 = await request(app).get(
       `/api/recipients/${VALID_RECIPIENT}/streams`,
     );
 
-    expect(res.status).toBe(200);
-    expect(res.body.total).toBe(1);
-    expect(res.body.data[0].id).toBe("1");
+    expect(res1.status).toBe(200);
+    expect(res1.body.total).toBe(1);
+    expect(res1.body.data[0].id).toBe("1");
+    expect(res1.body.data[0].recipient).toBe(VALID_RECIPIENT);
     expect(streamStoreMocks.listStreamsByRecipient).toHaveBeenCalledTimes(2);
     expect(streamStoreMocks.createStream).not.toHaveBeenCalled();
     expect(eventHistoryMocks.recordEvent).not.toHaveBeenCalled();
+    expect(eventHistoryMocks.recordEventWithDb).not.toHaveBeenCalled();
+    expect(rpcDouble.sendTransaction).not.toHaveBeenCalled();
+
+    streamStoreMocks.listStreamsByRecipient.mockClear();
+    const pgTimeoutErr = Object.assign(
+      new Error("canceling statement due to statement timeout"),
+      { code: "57014" },
+    );
+    streamStoreMocks.listStreamsByRecipient
+      .mockImplementationOnce(() => {
+        throw pgTimeoutErr;
+      })
+      .mockImplementationOnce((recipientAddress: string) =>
+        dbTableDouble.filter((row) => row.recipient === recipientAddress),
+      );
+
+    const res2 = await request(app).get(
+      `/api/streams/recipient/${VALID_RECIPIENT}`,
+    );
+    expect(res2.status).toBe(200);
+    expect(res2.body.total).toBe(1);
+    expect(res2.body.data[0].id).toBe("1");
+    expect(streamStoreMocks.listStreamsByRecipient).toHaveBeenCalledTimes(2);
+    expect(cacheSetMock).toHaveBeenCalledTimes(1);
+    expect(cacheSetMock).toHaveBeenCalledWith(
+      `streams:recipient:${VALID_RECIPIENT}`,
+      [sampleStream],
+      5,
+    );
   });
 
-  it("returns 503 DATABASE_TIMEOUT when database query timeout persists across retry on both recipient endpoints", async () => {
+  it("returns 503 DATABASE_TIMEOUT when database query timeout persists across retry on both recipient endpoints without duplicate side effects", async () => {
     const timeoutErr = Object.assign(
       new Error("Database query timed out while reading streams"),
       { code: "ETIMEDOUT" },
@@ -192,8 +287,9 @@ describe("Recipient streams endpoint recovery & account validation (#1055)", () 
     );
     expect(res2.status).toBe(503);
     expect(res2.body.code).toBe("DATABASE_TIMEOUT");
-    // Cache fallback also invokes fetcher, each with 1 timeout retry
-    expect(streamStoreMocks.listStreamsByRecipient).toHaveBeenCalled();
+    expect(streamStoreMocks.listStreamsByRecipient).toHaveBeenCalledTimes(2);
+    expect(cacheSetMock).not.toHaveBeenCalled();
     expect(eventHistoryMocks.recordEventWithDb).not.toHaveBeenCalled();
+    expect(dbTableDouble).toHaveLength(2);
   });
 });

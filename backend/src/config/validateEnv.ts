@@ -600,8 +600,13 @@ export function validateEnv(): ValidatedConfig {
       adminApiKey = process.env.ADMIN_API_KEY;
     }
   } else if (isProduction) {
+    logger.error(
+      'ADMIN_API_KEY is not set in production — refusing to start',
+    );
+    throw new Error('Environment validation failed');
+  } else {
     logger.warn(
-      'ADMIN_API_KEY is not set in production — admin endpoints will be inaccessible',
+      'ADMIN_API_KEY is not set — admin endpoints will be inaccessible in this environment',
     );
   }
 

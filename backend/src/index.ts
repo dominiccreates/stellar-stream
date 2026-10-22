@@ -133,25 +133,62 @@ const port = Number(process.env.PORT ?? 3001);
 const ASSET_CODE_REGEX = /^[A-Za-z0-9]{1,12}$/;
 
 /**
+ * Normalize, deduplicate, and sort an iterable of asset codes into the
+ * canonical allowlist representation (`trim()`, `toUpperCase()`, unique,
+ * sorted lexicographically `A–Z`, `0–9`).
+ *
+ * Consistency rule (SSB-2026-123):
+ * - Every handler (`GET /api/assets`, `GET /api/admin/assets`,
+ *   `POST /api/admin/assets`, `DELETE /api/admin/assets/:code`), service
+ *   (`getAllowedAssets`, `addAllowedAsset`, `removeAllowedAsset`,
+ *   `evaluateAssetAllowlistConfig`), and startup parser (`parseAllowedAssetsConfig`)
+ *   returns this exact normalized sorted asset list.
+ * - Mutations only return a `200` with the updated list after the underlying
+ *   SQLite write has committed; on validation or storage failure, the handler
+ *   returns an error response without claiming a state change.
+ */
+export function normalizeAssetAllowlist(assets: Iterable<string>): string[] {
+  const normalized = new Set<string>();
+  for (const raw of assets) {
+    if (typeof raw !== "string") continue;
+    const code = raw.trim().toUpperCase();
+    if (code.length > 0) {
+      normalized.add(code);
+    }
+  }
+  return Array.from(normalized).sort();
+}
+
+/**
  * Parse and validate the ALLOWED_ASSETS environment configuration.
  *
  * Boundary semantics (documented, deterministic):
  * - Each entry is trimmed and upper-cased (mixed-case input is normalized).
- * - Empty entries (e.g. from trailing commas) are ignored.
+ * - Empty entries (e.g. from trailing commas) or empty/whitespace-only
+ *   configurations are rejected on startup.
  * - Duplicate entries (case-insensitive, post-normalization) are collapsed.
  * - The resulting list is de-duplicated and sorted for a stable order.
- * - If any entry is not 1-12 alphanumeric characters, startup fails with an
- *   explicit error (invalid configuration on startup) rather than silently
- *   dropping or accepting it.
+ * - If any entry is not 1-12 alphanumeric characters or no valid asset codes
+ *   are provided, startup fails with an explicit error (invalid configuration
+ *   on startup) rather than silently dropping or accepting it.
  */
 export function parseAllowedAssetsConfig(raw: string | undefined): string[] {
   const source = raw === undefined ? "USDC,XLM" : raw;
-  const entries = source
-    .split(",")
-    .map((asset) => asset.trim().toUpperCase())
-    .filter((asset) => asset.length > 0);
+  const trimmedSource = source.trim();
+  if (trimmedSource.length === 0) {
+    throw new Error(
+      "Invalid ALLOWED_ASSETS configuration: ALLOWED_ASSETS must contain at least one asset code.",
+    );
+  }
 
-  const invalid = entries.filter((asset) => !ASSET_CODE_REGEX.test(asset));
+  const rawTokens = trimmedSource.split(",").map((asset) => asset.trim().toUpperCase());
+  if (rawTokens.some((token) => token.length === 0)) {
+    throw new Error(
+      "Invalid ALLOWED_ASSETS configuration: empty asset code entry is not allowed.",
+    );
+  }
+
+  const invalid = rawTokens.filter((asset) => !ASSET_CODE_REGEX.test(asset));
   if (invalid.length > 0) {
     throw new Error(
       `Invalid ALLOWED_ASSETS configuration: ${invalid
@@ -160,7 +197,7 @@ export function parseAllowedAssetsConfig(raw: string | undefined): string[] {
     );
   }
 
-  return Array.from(new Set(entries)).sort();
+  return normalizeAssetAllowlist(rawTokens);
 }
 
 const SORT_FIELDS = ["totalAmount", "startAt", "createdAt", "durationSeconds"] as const;
@@ -530,7 +567,7 @@ app.get("/api/assets", (req: Request, res: Response) => {
   const startPerf = Date.now();
   // Guarantee a stable, normalized, sorted, de-duplicated list regardless of
   // insertion order or duplicate rows in the backing store.
-  const assets = Array.from(new Set(getAllowedAssets().map((a) => a.toUpperCase()))).sort();
+  const assets = normalizeAssetAllowlist(getAllowedAssets());
   const latencyMs = Math.max(0, Date.now() - startPerf);
   const isNormalEmpty = assets.length === 0;
 
@@ -556,7 +593,7 @@ app.get("/api/assets", (req: Request, res: Response) => {
 
 app.get("/api/admin/assets", adminJwtAuth, (_req: Request, res: Response) => {
   res.json({
-    data: getAllowedAssets(),
+    data: normalizeAssetAllowlist(getAllowedAssets()),
   });
 });
 
@@ -571,29 +608,81 @@ app.post("/api/admin/assets", adminJwtAuth, (req: Request, res: Response) => {
     sendApiError(req, res, 400, "Asset code must be 1–12 alphanumeric characters.", { code: "VALIDATION_ERROR" });
     return;
   }
-  addAllowedAsset(cleanCode);
-  res.json({
-    data: getAllowedAssets(),
-  });
+  try {
+    const committed = addAllowedAsset(cleanCode);
+    res.json({
+      data: normalizeAssetAllowlist(committed),
+    });
+  } catch (error: any) {
+    logger.error({ err: error, assetCode: cleanCode }, "failed to add allowed asset");
+    const normalizedError = normalizeUnknownApiError(
+      error,
+      "Failed to update allowed assets.",
+    );
+    sendApiError(
+      req,
+      res,
+      normalizedError.statusCode,
+      normalizedError.message,
+      { code: normalizedError.code ?? "INTERNAL_ERROR" },
+    );
+  }
 });
 
 app.delete("/api/admin/assets/:code", adminJwtAuth, (req: Request, res: Response) => {
   const { code } = req.params;
-  if (!code) {
+  if (!code || typeof code !== "string" || !code.trim()) {
     sendApiError(req, res, 400, "Asset code is required.", { code: "VALIDATION_ERROR" });
     return;
   }
-  const cleanCode = (code as string).trim().toUpperCase();
-  removeAllowedAsset(cleanCode);
-  res.json({
-    data: getAllowedAssets(),
-  });
+  const cleanCode = code.trim().toUpperCase();
+  if (!ASSET_CODE_REGEX.test(cleanCode)) {
+    sendApiError(req, res, 400, "Asset code must be 1–12 alphanumeric characters.", { code: "VALIDATION_ERROR" });
+    return;
+  }
+  try {
+    const committed = removeAllowedAsset(cleanCode);
+    res.json({
+      data: normalizeAssetAllowlist(committed),
+    });
+  } catch (error: any) {
+    logger.error({ err: error, assetCode: cleanCode }, "failed to remove allowed asset");
+    const normalizedError = normalizeUnknownApiError(
+      error,
+      "Failed to update allowed assets.",
+    );
+    sendApiError(
+      req,
+      res,
+      normalizedError.statusCode,
+      normalizedError.message,
+      { code: normalizedError.code ?? "INTERNAL_ERROR" },
+    );
+  }
 });
 
 app.post(["/api/admin/auth", "/api/auth/admin"], (req: Request, res: Response) => {
-  const apiKey = req.body?.apiKey || req.header("X-Admin-Key");
-  if (!apiKey || apiKey !== process.env.ADMIN_API_KEY) {
-    sendApiError(req, res, 401, "Invalid Admin API Key.", { code: "UNAUTHORIZED" });
+  const configured = process.env.ADMIN_API_KEY;
+  if (!configured || configured.length === 0) {
+    sendApiError(req, res, 401, "Admin API key is not configured on this server.", {
+      code: "ADMIN_KEY_NOT_CONFIGURED",
+    });
+    return;
+  }
+  const bodyKey = typeof req.body?.apiKey === "string" ? req.body.apiKey : undefined;
+  const headerKeyRaw = req.header("X-Admin-Key");
+  const headerKey = Array.isArray(headerKeyRaw) ? undefined : headerKeyRaw;
+  const apiKey = (bodyKey ?? headerKey ?? "").trim();
+  if (apiKey.length === 0) {
+    sendApiError(req, res, 401, "Missing or empty Admin API key.", {
+      code: "ADMIN_KEY_MISSING",
+    });
+    return;
+  }
+  if (apiKey !== configured) {
+    sendApiError(req, res, 401, "Invalid Admin API key.", {
+      code: "ADMIN_KEY_INVALID",
+    });
     return;
   }
   const token = jwt.sign({ role: "admin", accountId: "admin", isAdmin: true }, getJwtSecret(), { expiresIn: "24h" });
@@ -951,12 +1040,20 @@ async function withAddressCache(
     const cache = getCache();
     const cached = await cache.get<StreamRecord[]>(key);
     if (cached) return cached;
-    const data = fetcher();
-    await cache.set(key, data, 5);
-    return data;
   } catch {
-    return fetcher();
+    // If cache lookup fails, proceed to fetcher without caching
   }
+
+  const data = fetcher();
+
+  try {
+    const cache = getCache();
+    await cache.set(key, data, 5);
+  } catch {
+    // If cache write fails, still return the fetched data without re-running fetcher
+  }
+
+  return data;
 }
 
 app.get(
@@ -1060,7 +1157,8 @@ function isDatabaseTimeoutError(error: unknown): boolean {
     code === "ETIMEDOUT" ||
     code === "QUERY_TIMEOUT" ||
     code === "DATABASE_TIMEOUT" ||
-    /timeout|timed out|database is locked|sqlite_busy/i.test(message)
+    code === "57014" ||
+    /timeout|timed out|database is locked|sqlite_busy|sqlite_locked/i.test(message)
   );
 }
 

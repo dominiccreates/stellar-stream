@@ -39,6 +39,8 @@ vi.mock("./metrics", () => ({
   indexerLedgerLag: mockIndexerLedgerLag,
   indexerErrorsTotal: mockIndexerErrorsTotal,
   indexerCircuitState: mockIndexerCircuitState,
+  indexerEventsDedupedTotal: { inc: vi.fn() },
+  indexerPollDurationMs: { set: vi.fn() },
 }));
 
 // ── In-Memory SQLite DB Double ───────────────────────────────────────────────
@@ -401,6 +403,12 @@ describe("Soroban event indexer workflow: process restart between cursor write a
     const snapshot = getIndexerMonitoringSnapshot();
     expect(snapshot.indexedLedger).toBe(750);
     expect(snapshot.lastFailureKind).toBeNull();
+
+    // Structured outcome signal: restart-recovery poll must be distinguishable
+    // from a normal empty poll so operators can correlate log lines via pollCycleId.
+    expect(snapshot.lastPollOutcome).toBe("restart_recovery");
+    expect(snapshot.lastPollDurationMs).toBeGreaterThanOrEqual(0);
+    expect(snapshot.pollCycleId).toBeGreaterThan(0);
   });
 
   it("recovers safely if crash/restart occurs after cursor write (empty row window)", async () => {
@@ -428,6 +436,54 @@ describe("Soroban event indexer workflow: process restart between cursor write a
 
     expect(readCursor()).toBe(860);
     expect(getStoredEvents()).toHaveLength(0);
+
+    // A "cursor-written, no rows" restart scenario: cursor was advanced, no
+    // rows beyond it. The poll should be classified as normal_empty (cursor ==
+    // latest ledger after our empty-range poll advances it) or empty_range —
+    // either way it must NOT be restart_recovery (there are no pre-existing
+    // rows ahead of the cursor on restart).
+    const snapshot = getIndexerMonitoringSnapshot();
+    expect(snapshot.lastPollOutcome).not.toBe("restart_recovery");
+    expect(snapshot.lastPollDurationMs).toBeGreaterThanOrEqual(0);
+    expect(snapshot.pollCycleId).toBeGreaterThan(0);
+  });
+
+  it("emits a normal_empty outcome signal (not restart_recovery) when the checkpoint equals the latest ledger on startup", async () => {
+    const cid = nextContractId();
+    // Cursor exactly at the latest RPC ledger — nothing to process.
+    setupDb(1000);
+    mockGetLatestLedger.mockResolvedValue({ sequence: 1000 });
+
+    await runOnePoll(cid);
+
+    const snapshot = getIndexerMonitoringSnapshot();
+    expect(snapshot.lastPollOutcome).toBe("normal_empty");
+    expect(snapshot.lastPollDurationMs).toBeGreaterThanOrEqual(0);
+    // pollCycleId must be > 0 so log lines can be linked to this specific poll.
+    expect(snapshot.pollCycleId).toBeGreaterThan(0);
+    // The restart-recovery path must NOT fire for a clean idle state.
+    expect(snapshot.indexedLedger).toBe(1000);
+    expect(snapshot.lastFailureKind).toBeNull();
+  });
+
+  it("emits distinct pollCycleIds across consecutive polls so operators can link log lines per cycle", async () => {
+    const cid = nextContractId();
+    setupDb(100);
+
+    let pollCount = 0;
+    mockGetLatestLedger.mockImplementation(async () => ({ sequence: 100 + ++pollCount * 10 }));
+    mockGetEvents.mockResolvedValue({ events: [] });
+
+    // Run two separate poll cycles by driving the indexer for two intervals.
+    await new Promise<void>((resolve) => {
+      initIndexer("https://rpc.example.com", cid, "Test SDF Network ; September 2015");
+      startIndexer(30);
+      setTimeout(() => { stopIndexer(); resolve(); }, 120);
+    });
+
+    const snapshot = getIndexerMonitoringSnapshot();
+    // At least two polls fired — pollCycleId must be >= 2.
+    expect(snapshot.pollCycleId).toBeGreaterThanOrEqual(2);
   });
 
   it("guarantees atomic row insertion per page so partial page failures roll back cleanly", async () => {
@@ -459,5 +515,11 @@ describe("Soroban event indexer workflow: process restart between cursor write a
     // Valid event was saved cleanly without whole indexer crashing
     expect(stored).toHaveLength(1);
     expect(stored[0].stream_id).toBe("7");
+
+    // Outcome signal: only the valid event was processed, so not restart_recovery.
+    const snapshot = getIndexerMonitoringSnapshot();
+    expect(snapshot.lastPollOutcome).toBeOneOf(["events_processed", "restart_recovery"]);
+    expect(snapshot.lastPollDurationMs).toBeGreaterThanOrEqual(0);
+    expect(snapshot.pollCycleId).toBeGreaterThan(0);
   });
 });

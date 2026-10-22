@@ -39,6 +39,8 @@ vi.mock("./metrics", () => ({
   indexerLedgerLag: mockIndexerLedgerLag,
   indexerErrorsTotal: { inc: vi.fn() },
   indexerCircuitState: { set: vi.fn() },
+  indexerEventsDedupedTotal: { inc: vi.fn() },
+  indexerPollDurationMs: { set: vi.fn() },
 }));
 
 // ── In-memory DB (replaced per-test via setupDb) ──────────────────────────────

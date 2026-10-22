@@ -51,7 +51,7 @@ describe("Assets API Configuration", () => {
     const response = await request(app).get("/api/assets");
     
     expect(response.status).toBe(200);
-    expect(response.body.data).toEqual(["YUSD", "EURO", "TESTCOIN"]);
+    expect(response.body.data).toEqual(["EURO", "TESTCOIN", "YUSD"]);
   }, 15000);
 
   it("should deduplicate case-insensitive asset codes while preserving normalized sorted output", async () => {
@@ -237,6 +237,136 @@ describe("Assets API Configuration", () => {
       });
     
     expect(response.status).toBe(400);
-    expect(response.body.error).toContain("BEDCOIN");
+    expect(response.body.error).toContain("BADCOIN");
+  });
+
+  describe("Normalized sorted asset list consistency rule (SSB-2026-123)", () => {
+    it("returns the exact same normalized sorted asset list across GET /api/assets, GET /api/admin/assets, POST /api/admin/assets, and DELETE /api/admin/assets/:code", async () => {
+      vi.stubEnv("ALLOWED_ASSETS", "xlm, usdc, XLM, UsDc, eurc");
+
+      const { initDb } = await import("./services/db");
+      initDb();
+
+      const { app } = await import("./index");
+      const { getJwtSecret } = await import("./services/auth");
+      const adminToken = jwt.sign(
+        { role: "admin", accountId: "admin", isAdmin: true },
+        getJwtSecret(),
+        { expiresIn: "1h" },
+      );
+
+      const publicGet1 = await request(app).get("/api/assets");
+      const adminGet1 = await request(app)
+        .get("/api/admin/assets")
+        .set("Authorization", `Bearer ${adminToken}`);
+
+      expect(publicGet1.status).toBe(200);
+      expect(adminGet1.status).toBe(200);
+      expect(publicGet1.body.data).toEqual(["EURC", "USDC", "XLM"]);
+      expect(adminGet1.body.data).toEqual(publicGet1.body.data);
+
+      // Add "btc" (sorts before EURC) in mixed case
+      const postBtc = await request(app)
+        .post("/api/admin/assets")
+        .set("Authorization", `Bearer ${adminToken}`)
+        .send({ code: "  bTc  " });
+      expect(postBtc.status).toBe(200);
+      expect(postBtc.body.data).toEqual(["BTC", "EURC", "USDC", "XLM"]);
+
+      const adminGet2 = await request(app)
+        .get("/api/admin/assets")
+        .set("Authorization", `Bearer ${adminToken}`);
+      const publicGet2 = await request(app).get("/api/assets");
+      expect(adminGet2.body.data).toEqual(["BTC", "EURC", "USDC", "XLM"]);
+      expect(publicGet2.body.data).toEqual(["BTC", "EURC", "USDC", "XLM"]);
+
+      // Delete "usdc" in lowercase
+      const deleteUsdc = await request(app)
+        .delete("/api/admin/assets/usdc")
+        .set("Authorization", `Bearer ${adminToken}`);
+      expect(deleteUsdc.status).toBe(200);
+      expect(deleteUsdc.body.data).toEqual(["BTC", "EURC", "XLM"]);
+
+      const adminGet3 = await request(app)
+        .get("/api/admin/assets")
+        .set("Authorization", `Bearer ${adminToken}`);
+      const publicGet3 = await request(app).get("/api/assets");
+      expect(adminGet3.body.data).toEqual(["BTC", "EURC", "XLM"]);
+      expect(publicGet3.body.data).toEqual(["BTC", "EURC", "XLM"]);
+    });
+
+    it("does not claim a change or alter committed state when POST or DELETE fails validation or storage", async () => {
+      vi.stubEnv("ALLOWED_ASSETS", "USDC,XLM");
+
+      const dbModule = await import("./services/db");
+      dbModule.initDb();
+
+      const { app } = await import("./index");
+      const { getJwtSecret } = await import("./services/auth");
+      const adminToken = jwt.sign(
+        { role: "admin", accountId: "admin", isAdmin: true },
+        getJwtSecret(),
+        { expiresIn: "1h" },
+      );
+
+      // 1. Invalid asset code on POST must fail with 400 and leave committed state untouched
+      const badPost = await request(app)
+        .post("/api/admin/assets")
+        .set("Authorization", `Bearer ${adminToken}`)
+        .send({ code: "INVALID$ASSET!" });
+      expect(badPost.status).toBe(400);
+      expect(badPost.body.data).toBeUndefined();
+
+      // 2. Invalid asset code on DELETE must fail with 400 and leave committed state untouched
+      const badDelete = await request(app)
+        .delete("/api/admin/assets/INVALID$ASSET!")
+        .set("Authorization", `Bearer ${adminToken}`);
+      expect(badDelete.status).toBe(400);
+      expect(badDelete.body.data).toBeUndefined();
+
+      const afterValidationFailures = await request(app).get("/api/assets");
+      expect(afterValidationFailures.body.data).toEqual(["USDC", "XLM"]);
+
+      // 3. Simulated database write failure on POST must return 500 and not claim a change
+      const rawDb = dbModule.getDb();
+      const origPrepare = rawDb.prepare.bind(rawDb);
+      const prepareSpy = vi.spyOn(rawDb, "prepare").mockImplementation((sql: string) => {
+        if (sql.includes("INSERT") && sql.includes("allowed_assets")) {
+          return {
+            run: () => {
+              throw new Error("SQLITE_BUSY: database is locked");
+            },
+          };
+        }
+        return origPrepare(sql);
+      });
+
+      const failedPost = await request(app)
+        .post("/api/admin/assets")
+        .set("Authorization", `Bearer ${adminToken}`)
+        .send({ code: "EURC" });
+      expect(failedPost.status).toBe(500);
+      expect(failedPost.body.data).toBeUndefined();
+
+      prepareSpy.mockRestore();
+
+      // Committed state is still ["USDC", "XLM"] — EURC was never committed
+      const afterDbFailure = await request(app).get("/api/assets");
+      expect(afterDbFailure.body.data).toEqual(["USDC", "XLM"]);
+    });
+
+    it("rejects invalid startup ALLOWED_ASSETS configuration (empty, trailing comma, or malformed codes) without seeding partial state", async () => {
+      const { parseAllowedAssetsConfig } = await import("./index");
+
+      expect(() => parseAllowedAssetsConfig("")).toThrow(/ALLOWED_ASSETS/);
+      expect(() => parseAllowedAssetsConfig("   ")).toThrow(/ALLOWED_ASSETS/);
+      expect(() => parseAllowedAssetsConfig("USDC,")).toThrow(/ALLOWED_ASSETS/);
+      expect(() => parseAllowedAssetsConfig("USDC,BAD$CODE")).toThrow(/ALLOWED_ASSETS/);
+      expect(parseAllowedAssetsConfig("xlm, usdc, XLM, eurc")).toEqual([
+        "EURC",
+        "USDC",
+        "XLM",
+      ]);
+    });
   });
 });

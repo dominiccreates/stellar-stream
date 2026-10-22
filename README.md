@@ -481,7 +481,7 @@ Copy `backend/.env.example` to `backend/.env` and `frontend/.env.example` to `fr
 
 4. **`ADMIN_API_KEY` & Production Environment**:
    - In production (`NODE_ENV=production`), `ADMIN_API_KEY` is enforced to be at least 32 characters (`z.string().min(32)`).
-   - If `ADMIN_API_KEY` is omitted in production, admin management endpoints (`/api/admin/*`) are disabled and return `401 Unauthorized`. In development, shorter keys emit a warning log.
+   - If `ADMIN_API_KEY` is omitted in production, `validateEnv` throws at startup and the server refuses to boot. This is intentional: silently starting with admin endpoints returning 401 is impossible to diagnose. In development, the key is optional; when unset, admin endpoints return `401` with `code: ADMIN_KEY_NOT_CONFIGURED`. Short keys still emit a warning log in development.
 
 ---
 
@@ -513,6 +513,30 @@ When rotating sensitive operational credentials in production, follow these proc
    - Generate a new random string of at least 32 characters.
    - Update `ADMIN_API_KEY` in backend environment config and restart backend services.
    - Update API key headers in administrative scripts, deployment pipelines, and internal tools calling `/api/admin/*`.
+
+#### Admin API key boundary contract
+
+Admin endpoints (`X-Admin-Key` header on routes using `adminAuth`, and the
+`POST /api/admin/auth` token exchange) return a stable `code` for every
+boundary input:
+
+| Input | Status | `code` |
+|---|---|---|
+| `X-Admin-Key` header absent | `401` | `ADMIN_KEY_MISSING` |
+| Header present but empty / whitespace-only | `401` | `ADMIN_KEY_MALFORMED` |
+| Header present but repeated (Express delivers `string[]`) | `401` | `ADMIN_KEY_MALFORMED` |
+| `ADMIN_API_KEY` env unset | `401` | `ADMIN_KEY_NOT_CONFIGURED` |
+| Header present, does not match configured key | `401` | `ADMIN_KEY_INVALID` |
+| Header present, matches configured key | `2xx` | - |
+
+All error bodies follow the standard `sendApiError` shape
+(`{ error, statusCode, requestId, correlationId, code }`).
+
+**Concurrent rotation**: `ADMIN_API_KEY` is read from `process.env` on every
+request, never cached at startup. Rotation therefore requires a process
+restart; requests already in-flight under the old process complete under the
+old key, and new requests hit the new process with the new key. No request is
+ever valid against both.
 
 ---
 

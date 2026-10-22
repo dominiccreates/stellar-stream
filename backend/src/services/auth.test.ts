@@ -266,6 +266,90 @@ describe("verifyChallengeAndIssueToken", () => {
         "Challenge missing required timestamp and nonce"
       );
     });
+
+    it("rejects an expired nonce as transient_delay, not reused", async () => {
+      const { clearNonceStoreForTesting, _getNonceStoreForTesting } = await import("./auth");
+      const { getLastAuthChallengeSignal, resetAuthChallengeOutcome } = await import("./authChallengeOutcome");
+      clearNonceStoreForTesting();
+      resetAuthChallengeOutcome();
+
+      const oldTimestamp = Math.floor(Date.now() / 1000) - 120;
+      let challenge = generateChallenge(clientKeypair.publicKey());
+      challenge = modifyChallengeOps(challenge, { timestamp: oldTimestamp });
+      const signedTx = signChallenge(challenge, clientKeypair);
+
+      await expect(verifyChallengeAndIssueToken(signedTx)).rejects.toThrow(
+        /timestamp is too old/i,
+      );
+
+      const signal = getLastAuthChallengeSignal();
+      expect(signal?.outcome).toBe("transient_delay");
+      expect(signal?.reason).toBe("expired_nonce");
+      for (const record of _getNonceStoreForTesting().values()) {
+        expect(record.consumed).toBe(false);
+      }
+    });
+
+    it("marks a successfully verified nonce as consumed and rejects reuse", async () => {
+      const { clearNonceStoreForTesting, _getNonceStoreForTesting } = await import("./auth");
+      const { getLastAuthChallengeSignal, resetAuthChallengeOutcome } = await import("./authChallengeOutcome");
+      clearNonceStoreForTesting();
+      resetAuthChallengeOutcome();
+
+      const nonce = "deterministic_nonce_0123456789abcdef";
+      let c1 = generateChallenge(clientKeypair.publicKey());
+      c1 = modifyChallengeOps(c1, { nonce });
+      await verifyChallengeAndIssueToken(signChallenge(c1, clientKeypair));
+
+      const record = _getNonceStoreForTesting().get(nonce);
+      expect(record?.consumed).toBe(true);
+      expect(record?.accountId).toBe(clientKeypair.publicKey());
+
+      let c2 = generateChallenge(clientKeypair.publicKey());
+      c2 = modifyChallengeOps(c2, { nonce });
+      await expect(
+        verifyChallengeAndIssueToken(signChallenge(c2, clientKeypair)),
+      ).rejects.toThrow(/already been used/i);
+      expect(getLastAuthChallengeSignal()?.reason).toBe("reused_nonce");
+    });
+
+    it("does NOT consume the nonce when the signature is invalid, so a retry succeeds", async () => {
+      const { clearNonceStoreForTesting } = await import("./auth");
+      clearNonceStoreForTesting();
+
+      const nonce = "retry_after_bad_sig_0123456789abcd";
+      let challenge = generateChallenge(clientKeypair.publicKey());
+      challenge = modifyChallengeOps(challenge, { nonce });
+
+      const wrongSigner = Keypair.random();
+      await expect(
+        verifyChallengeAndIssueToken(signChallenge(challenge, wrongSigner)),
+      ).rejects.toThrow();
+
+      const token = await verifyChallengeAndIssueToken(
+        signChallenge(challenge, clientKeypair),
+      );
+      expect(token).toBeDefined();
+    });
+
+    it("rejects a nonce presented under a different account as blocked", async () => {
+      const { clearNonceStoreForTesting } = await import("./auth");
+      clearNonceStoreForTesting();
+
+      const nonce = "cross_account_nonce_0123456789ab";
+      const alice = Keypair.random();
+      const bob = Keypair.random();
+
+      let c1 = generateChallenge(alice.publicKey());
+      c1 = modifyChallengeOps(c1, { nonce });
+      await verifyChallengeAndIssueToken(signChallenge(c1, alice));
+
+      let c2 = generateChallenge(bob.publicKey());
+      c2 = modifyChallengeOps(c2, { nonce });
+      await expect(
+        verifyChallengeAndIssueToken(signChallenge(c2, bob)),
+      ).rejects.toThrow(/different account/i);
+    });
   });
 
   describe("generateChallenge", () => {

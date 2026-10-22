@@ -80,6 +80,36 @@ export const indexerOutcome = new Gauge({
   registers: [register],
 });
 
+export const indexerEventsDedupedTotal = new Counter({
+  name: "indexer_events_deduped_total",
+  help: "Total number of contract events skipped by INSERT OR IGNORE because they were already present (replayed pages or restart recovery)",
+  registers: [register],
+});
+
+export const indexerPollDurationMs = new Gauge({
+  name: "indexer_poll_duration_ms",
+  help: "Wall-clock duration of the most recent completed indexer poll in milliseconds",
+  registers: [register],
+});
+
+/**
+ * Coarse outcome for a single indexer poll cycle.
+ *
+ * - `normal_empty`        — current ledger == checkpoint, no new ledgers to fetch.
+ * - `events_processed`    — one or more new events were written to the DB.
+ * - `empty_range`         — ledger range was new but RPC returned zero events.
+ * - `restart_recovery`    — the checkpoint was behind existing DB rows (row-before-
+ *                           cursor crash window); events were re-fetched and
+ *                           deduped by INSERT OR IGNORE.
+ * - `rpc_error`           — the poll failed with an RPC error (circuit breaker updated).
+ */
+export type IndexerPollOutcome =
+  | "normal_empty"
+  | "events_processed"
+  | "empty_range"
+  | "restart_recovery"
+  | "rpc_error";
+
 export const sqliteRestoreOutcome = new Gauge({
   name: "sqlite_restore_outcome",
   help: "SQLite restore schema check outcome at startup: 0=success, 1=transient_delay, 2=blocked, 3=interrupted",

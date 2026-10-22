@@ -16,11 +16,12 @@ describe("Asset allowlist outcome signals & boundary normalization (SSB-2026-121
   });
 
   describe("Duplicate & mixed-case asset code normalization", () => {
-    it("deduplicates redundant codes and normalizes mixed-case to uppercase", () => {
+    it("deduplicates redundant codes, normalizes mixed-case to uppercase, and sorts lexicographically", () => {
       const raw = "usdc, XLM, Usdc, xlm, btc, BTC, eth, Eth";
       const { validAssets, signal } = evaluateAssetAllowlistConfig(raw);
 
-      expect(validAssets).toEqual(["USDC", "XLM", "BTC", "ETH"]);
+      expect(validAssets).toEqual(["BTC", "ETH", "USDC", "XLM"]);
+      expect(signal.configuredAssets).toEqual(["BTC", "ETH", "USDC", "XLM"]);
       expect(signal.outcome).toBe("success");
       expect(signal.outcomeCode).toBe(ASSET_ALLOWLIST_OUTCOME_CODES.success);
       expect(signal.uniqueAssetsCount).toBe(4);
@@ -40,12 +41,12 @@ describe("Asset allowlist outcome signals & boundary normalization (SSB-2026-121
       expect(signal.outcome).toBe("success");
     });
 
-    it("preserves normalized sorted asset list order deterministically across duplicate inputs", () => {
+    it("preserves normalized sorted asset list order deterministically across duplicate and reordered inputs", () => {
       const a = evaluateAssetAllowlistConfig("XLM,USDC,XLM,USDC");
       resetAssetAllowlistOutcome();
-      const b = evaluateAssetAllowlistConfig("xlm,usdc,Xlm,Usdc");
+      const b = evaluateAssetAllowlistConfig("usdc,xlm,Xlm,Usdc");
 
-      expect(a.validAssets).toEqual(["XLM", "USDC"]);
+      expect(a.validAssets).toEqual(["USDC", "XLM"]);
       expect(b.validAssets).toEqual(a.validAssets);
       expect(a.signal.outcomeCode).toBe(b.signal.outcomeCode);
     });

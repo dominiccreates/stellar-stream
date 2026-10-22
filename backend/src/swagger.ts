@@ -632,8 +632,9 @@ export const swaggerDocument = {
       get: {
         summary: "List allowed assets",
         description:
-          "Returns the normalized and deduplicated list of active allowed asset codes for payment streams. " +
-          "Supports linking telemetry logs to a stream ID via the streamId query parameter.",
+          "Returns the canonical normalized sorted asset list (trimmed, uppercased, deduplicated, and sorted lexicographically `A–Z`, `0–9`) of active allowed asset codes for payment streams. " +
+          "Supports linking telemetry logs to a stream ID via the streamId query parameter.\n\n" +
+          "**Consistency rule (SSB-2026-123):** `GET /api/assets`, `GET /api/admin/assets`, `POST /api/admin/assets`, and `DELETE /api/admin/assets/{code}` all return the same normalized sorted asset list reflecting the committed database state. On validation or storage failure, mutation endpoints return an error status (`400`/`500`) without mutating state or claiming a change.",
         parameters: [
           {
             name: "streamId",
@@ -665,6 +666,125 @@ export const swaggerDocument = {
               },
             },
           },
+        },
+      },
+    },
+    "/api/admin/assets": {
+      get: {
+        summary: "List allowed assets (admin)",
+        description:
+          "Returns the committed normalized sorted asset list (`trim()`, `toUpperCase()`, deduplicated, sorted lexicographically). Requires an admin Bearer JWT.",
+        security: [{ bearerAuth: [] }],
+        responses: {
+          "200": {
+            description: "Committed normalized sorted allowed assets list.",
+            content: {
+              "application/json": {
+                schema: {
+                  type: "object",
+                  properties: {
+                    data: {
+                      type: "array",
+                      items: { type: "string", example: "USDC" },
+                    },
+                  },
+                },
+              },
+            },
+          },
+          "401": { description: "Missing or invalid authorization token." },
+          "403": { description: "Forbidden — admin privileges required." },
+        },
+      },
+      post: {
+        summary: "Add an allowed asset code (admin)",
+        description:
+          "Validates, normalizes (`trim().toUpperCase()`), and persists an asset code (`1–12` alphanumeric characters) into the allowlist. " +
+          "Duplicate or mixed-case variants of an existing code are idempotent no-ops. " +
+          "Returns `200` with the committed normalized sorted asset list on success; returns `400` or `500` on validation or storage failure without claiming a change.",
+        security: [{ bearerAuth: [] }],
+        requestBody: {
+          required: true,
+          content: {
+            "application/json": {
+              schema: {
+                type: "object",
+                required: ["code"],
+                properties: {
+                  code: {
+                    type: "string",
+                    pattern: "^[A-Za-z0-9]{1,12}$",
+                    example: "USDC",
+                  },
+                },
+              },
+            },
+          },
+        },
+        responses: {
+          "200": {
+            description: "Committed normalized sorted allowed assets list.",
+            content: {
+              "application/json": {
+                schema: {
+                  type: "object",
+                  properties: {
+                    data: {
+                      type: "array",
+                      items: { type: "string", example: "USDC" },
+                    },
+                  },
+                },
+              },
+            },
+          },
+          "400": { $ref: "#/components/responses/BadRequest" },
+          "401": { description: "Missing or invalid authorization token." },
+          "403": { description: "Forbidden — admin privileges required." },
+          "500": { description: "Storage failure — no allowlist state change was committed." },
+        },
+      },
+    },
+    "/api/admin/assets/{code}": {
+      delete: {
+        summary: "Remove an allowed asset code (admin)",
+        description:
+          "Validates, normalizes (`trim().toUpperCase()`), and removes an asset code from the allowlist (case-insensitive). " +
+          "Returns `200` with the committed normalized sorted asset list on success; returns `400` or `500` on validation or storage failure without claiming a change.",
+        security: [{ bearerAuth: [] }],
+        parameters: [
+          {
+            name: "code",
+            in: "path",
+            required: true,
+            schema: {
+              type: "string",
+              pattern: "^[A-Za-z0-9]{1,12}$",
+              example: "XLM",
+            },
+          },
+        ],
+        responses: {
+          "200": {
+            description: "Committed normalized sorted allowed assets list.",
+            content: {
+              "application/json": {
+                schema: {
+                  type: "object",
+                  properties: {
+                    data: {
+                      type: "array",
+                      items: { type: "string", example: "USDC" },
+                    },
+                  },
+                },
+              },
+            },
+          },
+          "400": { $ref: "#/components/responses/BadRequest" },
+          "401": { description: "Missing or invalid authorization token." },
+          "403": { description: "Forbidden — admin privileges required." },
+          "500": { description: "Storage failure — no allowlist state change was committed." },
         },
       },
     },

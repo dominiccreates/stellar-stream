@@ -20,7 +20,7 @@ Stellar SEP-10 web authentication allows clients to authenticate by proving owne
 | **Clean Verification** | Valid client signature matching `NETWORK_PASSPHRASE` | `outcome: "success"`, code `0`, `reason: "success"`. | Healthy authentication. Token issued. |
 | **Normal Empty Account** | Account has no Horizon record (unfunded account, 0 signers) | `outcome: "success"`, code `0`, `reason: "normal_empty_account"`, `isNormalEmpty: true`. | Expected onboarding state. Falls back to single-signer verification. |
 | **Timestamp Drift / Expiry** | `timeDiff > 60s` or TimeBounds exceeded | `outcome: "transient_delay"`, code `1`, `reason: "expired_nonce"`. | Self-healing transient issue. User requests a fresh challenge. |
-| **Replay Attack** | Nonce is already present in `nonceStore` | `outcome: "blocked"`, code `2`, `reason: "reused_nonce"`. | Security incident / stale request replayed. Intercepted and blocked. |
+| **Replay Attack** | Nonce is consumed or belongs to another account | `outcome: "blocked"`, code `2`, `reason: "reused_nonce"`. | Security incident / stale request replayed. Intercepted and blocked. |
 | **Wrong Network Signing** | Signature invalid under server network but valid under candidate network (`PUBLIC`, `FUTURENET`, `TESTNET`) | `outcome: "blocked"`, code `2`, `reason: "wrong_network"`. | User wallet misconfiguration. Actionable guidance required. |
 | **Invalid Signature / Malformed** | Signature invalid on all candidate networks or corrupt XDR | `outcome: "blocked"`, code `2`, `reason: "invalid_signature"` or `"malformed_challenge"`. | Authentication failure. |
 
@@ -58,6 +58,7 @@ A common user issue occurs when a wallet (e.g., Freighter, Albedo, Lobstr) is co
 ### Operator & User Action
 - Instruct the user to open their Stellar wallet extension/application and switch the active network to match the server network (e.g. switch Freighter network from "Public" to "Testnet").
 - Verify `NETWORK_PASSPHRASE` environment variable on the server deployment.
+- Sign the original server-issued challenge again on the expected network, without retaining the wrong-network client signature. A failed signature does not consume the nonce. If the challenge has expired, request and sign a fresh challenge instead.
 
 ---
 
@@ -71,11 +72,19 @@ The authentication workflow enforces strict separation between transient clock d
    - Counter/Gauge: Gauge set to `1`. No replay alert fired.
 
 2. **Replayed Nonce (`blocked`, Code 2)**:
-   - Condition: Nonce exists in memory within the 60-second validity window.
+   - Condition: Nonce is already consumed or belongs to another account within the validity window. An unconsumed nonce for the same account remains retryable.
    - Security Signal: Counter `auth_challenge_replay_total` is incremented.
    - Gauge set to `2`. Operator should review if traffic originates from a distributed replay attack or automated bot.
 
 ---
+
+### Recovery and commit boundary
+
+Timestamp and nonce validity are checked both before Horizon lookup and immediately before token signing. Concurrent submissions in the same server process can issue only one token: subsequent submissions receive `reused_nonce`, with no additional success event. A challenge that expires during lookup receives `expired_nonce`; request a fresh challenge to recover.
+
+The nonce is consumed and success telemetry is emitted only after synchronous JWT signing succeeds. A signing failure leaves the nonce unconsumed and emits no success event, so the same signed challenge can be retried while it is fresh. If a successful response is lost, request a new challenge; a consumed nonce cannot recover the previous token. Authentication does not submit ledger transactions or perform money movements.
+
+These guarantees use the existing in-memory nonce store and apply within one process. They do not provide shared replay protection across replicas or process restarts.
 
 ## 5. Observable Telemetry & Prometheus Metrics
 
@@ -147,8 +156,32 @@ Run unit and boundary regression tests:
 
 ```bash
 cd backend
-npx vitest run src/services/auth.test.ts src/services/auth.observability.test.ts
+npx vitest run src/services/auth.test.ts src/services/auth.observability.test.ts src/services/auth.recovery.test.ts
 npx eslint src/services/auth.ts src/services/authChallengeOutcome.ts src/services/metrics.ts src/services/auth.observability.test.ts
 ```
 
 All boundary cases (wrong network, normal empty case, replay attack, expired challenge, secret redaction, and metric counters) are covered.
+
+## Boundary semantics (SSB-2026-161 / #1104)
+
+All three nonce boundary failures surface to the client as **HTTP 401** with
+`code: "UNAUTHORIZED"`. The distinction between them exists for observability
+and for the retry guarantee below.
+
+| Boundary | Store state when seen | Outcome signal | `reason` | Client action |
+|---|---|---|---|---|
+| Expired nonce | record present, `expiresAt < now` | `transient_delay` (1) | `expired_nonce` | request a new challenge |
+| Reused nonce (same account, valid) | record present, `consumed: true` or `expiresAt >= now` | `blocked` (2) | `reused_nonce` | request a new challenge |
+| Cross-account nonce | record present, `accountId` differs | `blocked` (2) | `reused_nonce` | request a new challenge |
+| Wrong-network signature | record present, `consumed: false` | `blocked` (2) | `wrong_network` | fix wallet network, retry **same** nonce |
+| Invalid signature | record present, `consumed: false` | `blocked` (2) | `invalid_signature` | fix signing, retry **same** nonce |
+| Fresh, valid | record absent | insert `{consumed:false}`, verify, flip `consumed:true` | `success` | — |
+
+**Guarantee.** A nonce is flipped to `consumed: true` **only after**
+`WebAuth.verifyChallengeTxSigners` returns at least one signer. A failed
+signature, a wrong-network signature, or a malformed transaction therefore
+never burns the nonce: the legitimate client can retry the same challenge.
+
+**Linkage.** Each nonce record is bound to the `accountId` that requested the
+challenge. Presenting the same nonce under a different account is classified
+as `reused_nonce` (blocked) and does not mutate either account's state.

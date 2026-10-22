@@ -773,8 +773,10 @@ impl StellarStreamContract {
     /// # Rounding
     ///
     /// Vesting uses integer (floor) division: `total_amount * elapsed / duration`.
-    /// Each call truncates sub-token fractions.  Dust (at most 1 token per partial claim
-    /// cycle) accumulates and becomes claimable once vesting reaches `total_amount`.
+    /// Rounding applies to cumulative vesting, not separately to each claim.
+    /// Repeated partial claims subtract the exact cumulative `claimed_amount`;
+    /// they do not accumulate additional rounding loss. The final remainder is
+    /// claimable at `end_time`.
     ///
     /// # Arithmetic safety
     ///
@@ -1461,8 +1463,9 @@ where
 ///
 /// # Rounding
 ///
-/// Uses integer (floor) division.  Dust of at most 1 token per call cycle
-/// may accumulate and will become claimable once `at_time >= end_time`.
+/// Uses integer (floor) division of cumulative vesting. Less than one base
+/// token unit is deferred at an intermediate timestamp, regardless of the
+/// number of claims. At `end_time` the full total is vested.
 ///
 /// # Arithmetic safety
 ///
@@ -1519,3 +1522,6 @@ fn vested_amount(stream: &Stream, at_time: u64) -> i128 {
 
 #[cfg(test)]
 mod test;
+
+#[cfg(test)]
+mod claimable_events_test;

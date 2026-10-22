@@ -13,12 +13,22 @@ The Asset Allowlist subsystem loads and maintains the active set of token codes 
 
 | Condition | Input / Event | System Behavior | Operator Classification |
 |---|---|---|---|
-| **Valid Configuration** | `ALLOWED_ASSETS="USDC,XLM"` | Normalizes codes, seeds unique records into `allowed_assets`. | **Success** (`outcome: "success"`, code `0`, `isNormalEmpty: false`). |
-| **Duplicate Codes** | `ALLOWED_ASSETS="USDC,xlm,Usdc,XLM"` | Deduplicates to `["USDC", "XLM"]`, increments `asset_allowlist_duplicates_total`. | **Success** (`outcome: "success"`, code `0`, `duplicateCount: 2`). |
-| **Mixed-case Codes** | `ALLOWED_ASSETS="yusd, euRo, testCoin "` | Trims whitespace and normalizes to uppercase: `["YUSD", "EURO", "TESTCOIN"]`. | **Success** (`outcome: "success"`, code `0`). |
+| **Valid Configuration** | `ALLOWED_ASSETS="USDC,XLM"` | Normalizes, deduplicates, and sorts codes lexicographically (`["USDC", "XLM"]`), seeding unique records into `allowed_assets`. | **Success** (`outcome: "success"`, code `0`, `isNormalEmpty: false`). |
+| **Duplicate Codes** | `ALLOWED_ASSETS="USDC,xlm,Usdc,XLM"` | Deduplicates and sorts to `["USDC", "XLM"]`, increments `asset_allowlist_duplicates_total`. | **Success** (`outcome: "success"`, code `0`, `duplicateCount: 2`). |
+| **Mixed-case Codes** | `ALLOWED_ASSETS="yusd, euRo, testCoin "` | Trims whitespace, normalizes to uppercase, and sorts lexicographically: `["EURO", "TESTCOIN", "YUSD"]`. | **Success** (`outcome: "success"`, code `0`). |
 | **Normal Empty Case** | Allowlist query on empty store / test baseline | Returns `data: []` without throwing 500 or failing. | **Normal empty case** (`isNormalEmpty: true`, `outcome: "success"`, code `0`). |
-| **Empty Config Failure** | `ALLOWED_ASSETS=""` or whitespace-only | Fails startup validation, emits structured blocked signal. | **Configuration Failure** (`outcome: "blocked"`, code `2`, `isNormalEmpty: false`). |
-| **Malformed Codes Failure** | Asset code violating 1–12 alphanumeric rule (e.g. `!@#$`, length > 12) | Fails startup validation, emits structured blocked signal with detail. | **Configuration Failure** (`outcome: "blocked"`, code `2`, `isNormalEmpty: false`). |
+| **Empty Config Failure** | `ALLOWED_ASSETS=""` or whitespace-only | Fails startup validation, emits structured blocked signal, and refuses to seed partial state. | **Configuration Failure** (`outcome: "blocked"`, code `2`, `isNormalEmpty: false`). |
+| **Malformed Codes Failure** | Asset code violating 1–12 alphanumeric rule (e.g. `!@#$`, length > 12) | Fails startup validation, emits structured blocked signal with detail, and refuses to seed partial state. | **Configuration Failure** (`outcome: "blocked"`, code `2`, `isNormalEmpty: false`). |
+
+---
+
+## 1.1 Normalized Sorted Asset List Consistency Rule (SSB-2026-123)
+
+Across startup validation (`parseAllowedAssetsConfig`), outcome evaluation (`evaluateAssetAllowlistConfig`), database persistence (`getAllowedAssets`, `addAllowedAsset`, `removeAllowedAsset`), stream payload validation (`createStreamPayloadWithAllowedAssetsSchema`), and all HTTP handlers (`GET /api/assets`, `GET /api/admin/assets`, `POST /api/admin/assets`, `DELETE /api/admin/assets/:code`), the asset allowlist obeys a single consistency rule:
+
+1. **Canonical representation**: Every asset code is trimmed (`trim()`), uppercased (`toUpperCase()`), deduplicated case-insensitively, and sorted in deterministic lexicographical order (`A–Z`, `0–9`) via `normalizeAssetAllowlist()`.
+2. **Committed-state guarantee on success**: Read and mutation handlers return `200` with `data` read from committed `allowed_assets` rows only after the underlying SQLite operation succeeds. Adding a duplicate or mixed-case variant of an already-allowlisted asset is an idempotent no-op that returns the same normalized sorted list.
+3. **No false change claims on failure**: Invalid configuration on startup (`parseAllowedAssetsConfig` / `seedAllowedAssets`) or invalid/failed runtime mutations (`POST /api/admin/assets`, `DELETE /api/admin/assets/:code`) fail before or during the database operation and return an error (`400 VALIDATION_ERROR` or `500 INTERNAL_ERROR`) without mutating `allowed_assets` or returning a `200` payload claiming a state change.
 
 ---
 
