@@ -166,4 +166,130 @@ describe("WebhookWorker", () => {
     expect(dead.last_error).toBe("500 Internal Server Error");
     expect(dead.url).toBe("https://example.com/webhook");
   });
+
+  it("prevents duplicate delivery during backoff after timeout and temporary 5xx, then clears retry state on success", async () => {
+    const db = getDb();
+    const now = Math.floor(Date.now() / 1000);
+
+    db.prepare(`
+      INSERT INTO webhook_deliveries (stream_id, event, payload, attempt, max_attempts, status, next_retry_at, created_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    `).run("s1", "event.created", '{"id":"s1"}', 0, 5, "pending", now - 10, now - 10);
+
+    // 1. First attempt times out
+    (axios.post as any).mockRejectedValueOnce(new Error("Connection timeout"));
+    const firstResults = await processWebhookQueue();
+
+    expect(axios.post).toHaveBeenCalledTimes(1);
+    expect(firstResults).toHaveLength(1);
+    expect(firstResults[0]).toMatchObject({
+      stream_id: "s1",
+      event: "event.created",
+      status: "pending",
+      attempt: 1,
+      max_attempts: 5,
+      error_message: "Connection timeout",
+      delay_seconds: 5,
+    });
+
+    let delivery = db.prepare("SELECT * FROM webhook_deliveries WHERE stream_id = ?").get("s1") as any;
+    expect(delivery.attempt).toBe(1);
+    expect(delivery.status).toBe("pending");
+    expect(delivery.next_retry_at).toBe(firstResults[0].next_retry_at);
+
+    // 2. Worker polls again before next_retry_at: must NOT send duplicate delivery
+    const duringBackoffResults = await processWebhookQueue();
+    expect(duringBackoffResults).toEqual([]);
+    expect(axios.post).toHaveBeenCalledTimes(1);
+
+    // 3. Advance retry window; second attempt returns temporary 503 response
+    db.prepare("UPDATE webhook_deliveries SET next_retry_at = ? WHERE id = ?").run(now - 5, delivery.id);
+    (axios.post as any).mockResolvedValueOnce({
+      status: 503,
+      statusText: "Service Unavailable",
+      data: {},
+    });
+
+    const secondResults = await processWebhookQueue();
+    expect(axios.post).toHaveBeenCalledTimes(2);
+    expect(secondResults).toHaveLength(1);
+    expect(secondResults[0]).toMatchObject({
+      id: delivery.id,
+      status: "pending",
+      attempt: 2,
+      max_attempts: 5,
+      error_message: "HTTP 503 Service Unavailable",
+      delay_seconds: 15,
+    });
+
+    delivery = db.prepare("SELECT * FROM webhook_deliveries WHERE id = ?").get(delivery.id) as any;
+    expect(delivery.attempt).toBe(2);
+    expect(delivery.status).toBe("pending");
+    expect(delivery.next_retry_at).toBe(secondResults[0].next_retry_at);
+
+    // 4. Advance retry window; third attempt succeeds
+    db.prepare("UPDATE webhook_deliveries SET next_retry_at = ? WHERE id = ?").run(now - 5, delivery.id);
+    (axios.post as any).mockResolvedValueOnce({ status: 200, data: { ok: true } });
+
+    const thirdResults = await processWebhookQueue();
+    expect(axios.post).toHaveBeenCalledTimes(3);
+    expect(thirdResults).toHaveLength(1);
+    expect(thirdResults[0]).toMatchObject({
+      id: delivery.id,
+      status: "success",
+      attempt: 3,
+      max_attempts: 5,
+      next_retry_at: null,
+      error_message: null,
+    });
+
+    delivery = db.prepare("SELECT * FROM webhook_deliveries WHERE id = ?").get(delivery.id) as any;
+    expect(delivery.status).toBe("success");
+    expect(delivery.attempt).toBe(3);
+    expect(delivery.next_retry_at).toBeNull();
+    expect(delivery.error_message).toBeNull();
+
+    // 5. Subsequent worker poll must NOT re-deliver the succeeded webhook
+    const afterSuccessResults = await processWebhookQueue();
+    expect(afterSuccessResults).toEqual([]);
+    expect(axios.post).toHaveBeenCalledTimes(3);
+  });
+
+  it("rolls back dead-letter insert and does not claim dead_lettered when deleting active delivery fails", async () => {
+    const db = getDb();
+    const now = Math.floor(Date.now() / 1000);
+
+    const insertRes = db.prepare(`
+      INSERT INTO webhook_deliveries (stream_id, event, payload, attempt, max_attempts, status, next_retry_at, created_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    `).run("s1", "event.created", '{"id":"s1"}', 2, 3, "pending", now - 10, now - 10);
+    const deliveryId = Number(insertRes.lastInsertRowid);
+
+    db.exec(`
+      CREATE TRIGGER fail_delivery_delete_on_dlq
+      BEFORE DELETE ON webhook_deliveries
+      WHEN OLD.id = ${deliveryId}
+      BEGIN
+        SELECT RAISE(ABORT, 'forced delivery delete failure');
+      END;
+    `);
+
+    try {
+      (axios.post as any).mockRejectedValueOnce(new Error("502 Bad Gateway"));
+      const results = await processWebhookQueue();
+
+      // Returned results must not claim a change when the transaction rolled back
+      expect(results).toEqual([]);
+      expect(countDeadLetters()).toBe(0);
+
+      const stillPending = db
+        .prepare("SELECT * FROM webhook_deliveries WHERE id = ?")
+        .get(deliveryId) as any;
+      expect(stillPending).toBeDefined();
+      expect(stillPending.status).toBe("pending");
+      expect(stillPending.attempt).toBe(2);
+    } finally {
+      db.exec("DROP TRIGGER IF EXISTS fail_delivery_delete_on_dlq");
+    }
+  });
 });

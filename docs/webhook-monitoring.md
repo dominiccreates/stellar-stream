@@ -87,3 +87,16 @@ Recovery:
 Rollback step:
 
 - If the receiver cannot be made healthy, keep the service running but disable the webhook destination for new deployments, preserve existing dead letters, and restore the last known working receiver configuration before requeueing.
+
+## Delivery state and retry consistency rules
+
+Across `backend/src/services/webhook.ts`, `backend/src/services/webhookWorker.ts`, and `POST /api/webhooks/dead-letters/:id/requeue`, webhook delivery state follows a single consistency contract for `attempt`, `max_attempts`, and `next_retry_at`:
+
+| Lifecycle transition | `status` | `attempt` | `next_retry_at` | `error_message` | Persistence guarantee |
+| --- | --- | --- | --- | --- | --- |
+| Initial enqueue (`triggerWebhook`) | `pending` | `0` | `created_at` (due immediately) | `NULL` | Returns the committed row on success; returns `null` if skipped or if persistence fails. |
+| Failed attempt with budget remaining (`attempt + 1 < max_attempts`, e.g. timeout or temporary `5xx`) | `pending` | `attempt + 1` | `last_attempt_at + RETRY_DELAYS[attempt]` (`5s, 15s, 60s, 300s, 900s`) | Latest failure reason | Updated atomically on `status = 'pending'`. Not re-picked up by the worker until `now >= next_retry_at`, preventing duplicate delivery during the backoff window. |
+| Successful attempt (initial or retry after timeout / `5xx`) | `success` | `attempt + 1` | `NULL` | `NULL` | Updated atomically on `status = 'pending'`. Clearing `next_retry_at` and setting `status = 'success'` prevents duplicate delivery on subsequent worker polls. |
+| Exhausted retry budget (`attempt + 1 >= max_attempts`) | moved to `webhook_dead_letters` | `max_attempts` | removed from `webhook_deliveries` | stored in `last_error` | Inserted into `webhook_dead_letters` and deleted from `webhook_deliveries` in a single database transaction so a failed delete cannot leave a duplicate active delivery. |
+| Dead-letter requeue (`requeueDeadLetter` / `POST /api/webhooks/dead-letters/:id/requeue`) | `pending` | `0` | `now` (due immediately) | `NULL` | Inserted into `webhook_deliveries` (`max_attempts = 5`) and deleted from `webhook_dead_letters` in a single transaction; returns committed state only after commit. |
+
