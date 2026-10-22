@@ -3,6 +3,7 @@ import axios from "axios";
 import { processWebhookQueue } from "./webhookWorker";
 import { initDb, getDb } from "./db";
 import { countDeadLetters } from "./webhook";
+import { logger } from "../logger";
 import fs from "fs";
 import path from "path";
 
@@ -60,6 +61,83 @@ describe("WebhookWorker", () => {
     expect(delivery.status).toBe("pending");
     expect(delivery.next_retry_at).toBeGreaterThan(now);
     expect(delivery.error_message).toBe("Connection timeout");
+  });
+
+  it("retries a timeout with the same idempotency key and succeeds without another failed attempt", async () => {
+    const db = getDb();
+    const now = Math.floor(Date.now() / 1000);
+    db.prepare(`
+      INSERT INTO webhook_deliveries (stream_id, event, payload, attempt, max_attempts, status, next_retry_at, created_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    `).run("s1", "event.created", '{"value":1}', 0, 3, "pending", now - 10, now - 10);
+
+    (axios.post as any).mockRejectedValueOnce(new Error("timeout"));
+    await processWebhookQueue();
+
+    let delivery = db.prepare("SELECT * FROM webhook_deliveries WHERE stream_id = ?").get("s1") as any;
+    expect(delivery.attempt).toBe(1);
+    expect(delivery.status).toBe("pending");
+    expect(delivery.error_message).toBe("timeout");
+    expect(delivery.next_retry_at).toBeGreaterThan(now);
+
+    db.prepare("UPDATE webhook_deliveries SET next_retry_at = ? WHERE id = ?").run(now - 10, delivery.id);
+    (axios.post as any).mockResolvedValueOnce({ status: 200 });
+    await processWebhookQueue();
+
+    delivery = db.prepare("SELECT * FROM webhook_deliveries WHERE stream_id = ?").get("s1") as any;
+    const calls = (axios.post as any).mock.calls;
+    expect(calls[0][2].headers["Idempotency-Key"]).toBe(calls[1][2].headers["Idempotency-Key"]);
+    expect(calls[0][1]).toBe(calls[1][1]);
+    expect(delivery.status).toBe("success");
+    expect(delivery.attempt).toBe(1);
+    expect(delivery.next_retry_at).toBeNull();
+  });
+
+  it("treats a temporary 5xx response as a failed attempt and schedules a retry", async () => {
+    const db = getDb();
+    const now = Math.floor(Date.now() / 1000);
+    db.prepare(`
+      INSERT INTO webhook_deliveries (stream_id, event, payload, attempt, max_attempts, status, next_retry_at, created_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    `).run("s1", "event.created", "{}", 0, 3, "pending", now - 10, now - 10);
+
+    (axios.post as any).mockResolvedValueOnce({ status: 503 });
+    await processWebhookQueue();
+
+    const delivery = db.prepare("SELECT * FROM webhook_deliveries WHERE stream_id = ?").get("s1") as any;
+    expect(delivery.status).toBe("pending");
+    expect(delivery.attempt).toBe(1);
+    expect(delivery.error_message).toBe("HTTP 503");
+    expect(delivery.next_retry_at).toBeGreaterThan(now);
+  });
+
+  it("logs a transient 5xx signal with the stream ID and sanitised latency details", async () => {
+    const db = getDb();
+    const now = Math.floor(Date.now() / 1000);
+    const loggerSpy = vi.spyOn(logger, "warn");
+
+    db.prepare(`
+      INSERT INTO webhook_deliveries (stream_id, event, payload, attempt, max_attempts, status, next_retry_at, created_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    `).run("s1", "event.created", "{}", 0, 3, "pending", now - 10, now - 10);
+
+    (axios.post as any).mockResolvedValueOnce({ status: 503 });
+    await processWebhookQueue();
+
+    expect(loggerSpy).toHaveBeenCalledWith(
+      expect.objectContaining({
+        event: "event.created",
+        streamId: "s1",
+        statusCode: 503,
+        outcome: "transient_delay",
+        outcomeCode: 1,
+        isNormalEmpty: false,
+      }),
+      expect.any(String),
+    );
+    const lastCall = loggerSpy.mock.calls.at(-1);
+    expect(lastCall?.[0]).toHaveProperty("latencyMs");
+    expect(lastCall?.[0]).not.toHaveProperty("err");
   });
 
   it("should follow backoff sequence on subsequent failures", async () => {

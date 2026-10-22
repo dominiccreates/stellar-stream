@@ -8,7 +8,7 @@ The monitoring signal is built from queue counts only. It does not select or pri
 
 | Surface | Purpose |
 | --- | --- |
-| `GET /api/webhooks/monitoring` | Auth-protected REST endpoint that returns `outcome`, `outcomeCode`, `detail`, and count-only queue state. |
+| `GET /api/webhooks/monitoring` | Auth-protected REST endpoint that returns `outcome`, `outcomeCode`, `detail`, `isNormalEmpty`, `latencyMs`, and count-only queue state. |
 | `/metrics` | Prometheus gauges for pending deliveries, due retries, scheduled retries, dead letters, and the coarse webhook outcome. |
 | `backend/src/services/webhookQueueStats.ts` | Count-only smoke-check helper for pending, due-now, scheduled retry, delivered, and dead-letter totals. |
 
@@ -30,8 +30,8 @@ If `WEBHOOK_DESTINATION_URL` contains query fields named like `token`, `secret`,
 
 | Outcome | Meaning | Owner action |
 | --- | --- | --- |
-| `success` | Nothing is pending or dead-lettered, or the destination is unconfigured and no work exists. | None. |
-| `transient_delay` | Deliveries are pending, with some due now or waiting for backoff, and the retry budget is intact. | None while the count falls. Watch that `pending == dueNow + scheduledRetries`. |
+| `success` | Nothing is pending or dead-lettered, or the destination is unconfigured and no work exists. When the queue is empty, `isNormalEmpty` is `true` so the empty case is clearly distinct from a failure. | None. |
+| `transient_delay` | Deliveries are pending, with some due now or waiting for backoff, and the retry budget is intact. A temporary `5xx` response is treated as a transient failure with a structured latency and retry signal. | None while the count falls. Watch that `pending == dueNow + scheduledRetries`. |
 | `blocked` | A delivery has exhausted retries, or work is queued while no destination URL is configured. | Fix the receiver or config, then requeue dead letters. |
 
 ## Clean environment reproduction
@@ -88,15 +88,9 @@ Rollback step:
 
 - If the receiver cannot be made healthy, keep the service running but disable the webhook destination for new deployments, preserve existing dead letters, and restore the last known working receiver configuration before requeueing.
 
-## Delivery state and retry consistency rules
+## Delivery and retry semantics
 
-Across `backend/src/services/webhook.ts`, `backend/src/services/webhookWorker.ts`, and `POST /api/webhooks/dead-letters/:id/requeue`, webhook delivery state follows a single consistency contract for `attempt`, `max_attempts`, and `next_retry_at`:
-
-| Lifecycle transition | `status` | `attempt` | `next_retry_at` | `error_message` | Persistence guarantee |
-| --- | --- | --- | --- | --- | --- |
-| Initial enqueue (`triggerWebhook`) | `pending` | `0` | `created_at` (due immediately) | `NULL` | Returns the committed row on success; returns `null` if skipped or if persistence fails. |
-| Failed attempt with budget remaining (`attempt + 1 < max_attempts`, e.g. timeout or temporary `5xx`) | `pending` | `attempt + 1` | `last_attempt_at + RETRY_DELAYS[attempt]` (`5s, 15s, 60s, 300s, 900s`) | Latest failure reason | Updated atomically on `status = 'pending'`. Not re-picked up by the worker until `now >= next_retry_at`, preventing duplicate delivery during the backoff window. |
-| Successful attempt (initial or retry after timeout / `5xx`) | `success` | `attempt + 1` | `NULL` | `NULL` | Updated atomically on `status = 'pending'`. Clearing `next_retry_at` and setting `status = 'success'` prevents duplicate delivery on subsequent worker polls. |
-| Exhausted retry budget (`attempt + 1 >= max_attempts`) | moved to `webhook_dead_letters` | `max_attempts` | removed from `webhook_deliveries` | stored in `last_error` | Inserted into `webhook_dead_letters` and deleted from `webhook_deliveries` in a single database transaction so a failed delete cannot leave a duplicate active delivery. |
-| Dead-letter requeue (`requeueDeadLetter` / `POST /api/webhooks/dead-letters/:id/requeue`) | `pending` | `0` | `now` (due immediately) | `NULL` | Inserted into `webhook_deliveries` (`max_attempts = 5`) and deleted from `webhook_dead_letters` in a single transaction; returns committed state only after commit. |
-
+- Any `2xx` response marks the delivery `success`. A successful delivery does not increase `attempt`, and `next_retry_at` is cleared because no further retry is scheduled.
+- Any non-`2xx` HTTP response, including a temporary `5xx`, and any transport error or timeout count as one failed attempt. The delivery remains pending with the configured backoff until it succeeds or exhausts `max_attempts`, after which it is moved to dead-letter storage. A timeout is ambiguous: the receiver may have processed the request even though this service did not receive its response.
+- Retries of the same queue row send the same `Idempotency-Key` (`stellar-stream-<delivery id>`) and the same request body. Receivers should retain processed keys and return the original success for a repeated key to avoid applying a timed-out request twice. A manually requeued dead letter is a new queue row and therefore has a new key.
+- `attempt` counts failed attempts, not total requests. Delivery rows and their keys are scoped to this service's database.

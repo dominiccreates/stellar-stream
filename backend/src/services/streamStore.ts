@@ -417,28 +417,26 @@ async function fetchOnChainStreamRecord(
   return result;
 }
 
-function recordBackfilledCreatedEvent(stream: StreamRecord): void {
+function recordBackfilledCreatedEvent(stream: StreamRecord, dbHandle?: any): void {
   if (streamHasEvent(stream.id, "created")) {
     return;
   }
 
-  const db = getDb();
-  db.transaction(() => {
-    recordEventWithDb(
-      db,
-      stream.id,
-      "created",
-      stream.createdAt,
-      stream.sender,
-      stream.totalAmount,
-      {
-        recipient: stream.recipient,
-        assetCode: stream.assetCode,
-        durationSeconds: stream.durationSeconds,
-        source: "reconciliation",
-      },
-    );
-  })();
+  const db = dbHandle ?? getDb();
+  recordEventWithDb(
+    db,
+    stream.id,
+    "created",
+    stream.createdAt,
+    stream.sender,
+    stream.totalAmount,
+    {
+      recipient: stream.recipient,
+      assetCode: stream.assetCode,
+      durationSeconds: stream.durationSeconds,
+      source: "reconciliation",
+    },
+  );
 }
 
 function computeStatus(stream: StreamRecord, at: number): StreamStatus {
@@ -722,18 +720,26 @@ export async function reconcileStream(streamId: string): Promise<StreamRecord> {
 
   try {
     const sourceAccount = await sorobanContext.sourceAccountPromise;
-    const onChainStream = await fetchOnChainStreamRecord(
-      sorobanContext.contract,
-      sourceAccount,
-      id,
-      true,
+    const onChainStream = await retryWithBackoff(
+      () =>
+        fetchOnChainStreamRecord(
+          sorobanContext.contract,
+          sourceAccount,
+          id,
+          true,
+        ),
+      2,
     );
 
     if (!onChainStream) {
       throw new Error("Stream not found on-chain");
     }
 
-    upsertStream(onChainStream);
+    const db = getDb();
+    db.transaction(() => {
+      upsertStream(onChainStream);
+      recordBackfilledCreatedEvent(onChainStream, db);
+    })();
 
     logger.info({ streamId }, "stream reconciled with on-chain state");
     return onChainStream;
@@ -751,10 +757,16 @@ export async function reconcileMissingStreams(): Promise<number> {
 
   try {
     const sourceAccount = await sorobanContext.sourceAccountPromise;
-    const nextId = await fetchNextOnChainStreamId(
-      sorobanContext.contract,
-      sourceAccount,
-    );
+    let nextId: number | null = null;
+    try {
+      nextId = await retryWithBackoff(
+        () => fetchNextOnChainStreamId(sorobanContext.contract, sourceAccount),
+        2,
+      );
+    } catch (err) {
+      logger.error({ err }, "failed to fetch next on-chain stream ID due to RPC outage");
+      return 0;
+    }
 
     if (nextId === null || nextId <= 1) {
       logger.info("no on-chain streams available to reconcile");
@@ -778,12 +790,18 @@ export async function reconcileMissingStreams(): Promise<number> {
     logger.warn({ missingCount: missingIds.length, missingIds }, "missing local streams detected");
 
     let repairedCount = 0;
+    const db = getDb();
+
     for (const missingId of missingIds) {
       try {
-        const stream = await fetchOnChainStreamRecord(
-          sorobanContext.contract,
-          sourceAccount,
-          missingId,
+        const stream = await retryWithBackoff(
+          () =>
+            fetchOnChainStreamRecord(
+              sorobanContext.contract,
+              sourceAccount,
+              missingId,
+            ),
+          2,
         );
 
         if (!stream) {
@@ -791,11 +809,19 @@ export async function reconcileMissingStreams(): Promise<number> {
           continue;
         }
 
-        upsertStream(stream);
-        recordBackfilledCreatedEvent(stream);
+        // Atomically commit stream and event in a single transaction.
+        // If event recording or upsert fails, the entire stream insertion rolls back cleanly.
+        db.transaction(() => {
+          upsertStream(stream);
+          recordBackfilledCreatedEvent(stream, db);
+        })();
+
         repairedCount += 1;
       } catch (err) {
-        logger.error({ err, streamId: missingId }, "failed to backfill missing stream");
+        logger.error({ err, streamId: missingId }, "failed to backfill missing stream due to RPC outage or error");
+        // On persistent RPC outage, abort remaining missing streams in this cycle to avoid hammering a down RPC provider,
+        // while preserving already committed streams.
+        break;
       }
     }
 

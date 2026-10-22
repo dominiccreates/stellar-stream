@@ -12,8 +12,31 @@ import { logger } from "../logger";
 let isProcessing = false;
 let pollingInterval: NodeJS.Timeout | null = null;
 
-export const processWebhookQueue = async (): Promise<WebhookDeliveryAttemptResult[]> => {
-  if (isProcessing) return [];
+function sanitizeWebhookError(error: any): Record<string, unknown> {
+  if (!error) {
+    return { message: "Unknown error" };
+  }
+
+  const summary: Record<string, unknown> = {
+    name: error.name,
+    message: error.message || "Unknown error",
+    code: error.code,
+  };
+
+  const statusCode = error.response?.status ?? error.status;
+  if (typeof statusCode === "number") {
+    summary.statusCode = statusCode;
+  }
+
+  if (typeof error.cause === "string") {
+    summary.cause = error.cause;
+  }
+
+  return summary;
+}
+
+export const processWebhookQueue = async () => {
+  if (isProcessing) return;
   isProcessing = true;
 
   const committedResults: WebhookDeliveryAttemptResult[] = [];
@@ -45,45 +68,108 @@ export const processWebhookQueue = async (): Promise<WebhookDeliveryAttemptResul
     for (const delivery of pendingDeliveries) {
       const { id, event, payload, attempt } = delivery;
       const parsedPayload = JSON.parse(payload);
+      const startTime = Date.now();
 
       let success = false;
       let errorMsg: string | null = null;
 
       try {
-        const timestamp = new Date().toISOString();
         const body = {
           event,
           payload: parsedPayload,
-          timestamp,
+          timestamp: new Date(Number(delivery.created_at) * 1000).toISOString(),
         };
         const bodyString = JSON.stringify(body);
         const headers = getWebhookHeaders(
           bodyString,
           process.env.WEBHOOK_SIGNING_SECRET,
+          String(id),
         );
 
-        const response = await axios.post(url, bodyString, { headers });
-        if (response && typeof response.status === "number" && response.status >= 400) {
-          const statusSuffix = response.statusText ? ` ${response.statusText}` : "";
-          throw new Error(`HTTP ${response.status}${statusSuffix}`);
+        const response = await axios.post(url, bodyString, {
+          headers,
+          validateStatus: () => true,
+        });
+        const latencyMs = Math.max(0, Date.now() - startTime);
+
+        if (response.status >= 200 && response.status < 300) {
+          success = true;
+          logger.info(
+            {
+              event,
+              deliveryId: id,
+              streamId: delivery.stream_id,
+              attempt: attempt + 1,
+              statusCode: response.status,
+              outcome: "success",
+              outcomeCode: 0,
+              latencyMs,
+              isNormalEmpty: false,
+            },
+            "webhook delivery succeeded",
+          );
+        } else {
+          errorMsg = `HTTP ${response.status}`;
+          logger.warn(
+            {
+              event,
+              deliveryId: id,
+              streamId: delivery.stream_id,
+              statusCode: response.status,
+              attempt: attempt + 1,
+              latencyMs,
+              outcome: response.status >= 500 && response.status < 600 ? "transient_delay" : "blocked",
+              outcomeCode: response.status >= 500 && response.status < 600 ? 1 : 2,
+              isNormalEmpty: false,
+              detail: response.status >= 500 && response.status < 600
+                ? "Temporary 5xx response from the webhook endpoint; retry scheduled."
+                : `Webhook endpoint returned HTTP ${response.status}; retry scheduled if attempts remain.`,
+            },
+            "webhook delivery attempt failed",
+          );
         }
-        success = true;
       } catch (error: any) {
-        errorMsg =
-          error?.message ||
-          (error?.response?.status ? `HTTP ${error.response.status}` : "Unknown error");
-        logger.error({ err: error, deliveryId: id, attempt: attempt + 1 }, "webhook delivery attempt failed");
+        const latencyMs = Math.max(0, Date.now() - startTime);
+        errorMsg = error.message || "Unknown error";
+        logger.warn(
+          {
+            event,
+            deliveryId: id,
+            streamId: delivery.stream_id,
+            attempt: attempt + 1,
+            latencyMs,
+            outcome: "transient_delay",
+            outcomeCode: 1,
+            isNormalEmpty: false,
+            detail: "Webhook endpoint timed out or was unreachable; retry scheduled.",
+            error: sanitizeWebhookError(error),
+          },
+          "webhook delivery attempt failed",
+        );
       }
 
       const updateNow = Math.floor(Date.now() / 1000);
 
-      try {
-        if (success) {
-          const committed = recordDeliverySuccess(id, updateNow);
-          if (committed) {
-            committedResults.push(committed);
-            logger.info({ deliveryId: id, event, attempt: committed.attempt }, "webhook delivery succeeded");
-          }
+      if (success) {
+        // Mark as success
+        db.prepare(
+          `UPDATE webhook_deliveries SET status = 'success', last_attempt_at = ?, next_retry_at = NULL WHERE id = ?`
+        ).run(updateNow, id);
+        logger.info({ deliveryId: id, event }, "webhook delivery succeeded");
+      } else {
+        // Handle failure and retries
+        const newAttempt = attempt + 1;
+        if (newAttempt >= max_attempts) {
+          // Move to dead-letter storage
+          db.prepare(
+            `INSERT INTO webhook_dead_letters (stream_id, event, url, payload, last_error, failed_at)
+             VALUES (?, ?, ?, ?, ?, ?)`
+          ).run(delivery.stream_id, event, url, payload, errorMsg, updateNow);
+
+          db.prepare(
+            `DELETE FROM webhook_deliveries WHERE id = ?`
+          ).run(id);
+          logger.error({ deliveryId: id, event, maxAttempts: max_attempts }, "webhook delivery moved to dead-letter storage");
         } else {
           const committed = recordDeliveryFailure(
             id,
@@ -123,7 +209,7 @@ export const processWebhookQueue = async (): Promise<WebhookDeliveryAttemptResul
       }
     }
   } catch (err: any) {
-    logger.error({ err }, "error processing webhook queue");
+    logger.error({ error: sanitizeWebhookError(err) }, "error processing webhook queue");
   } finally {
     isProcessing = false;
   }
